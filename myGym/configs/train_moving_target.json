@@ -1,0 +1,67 @@
+{
+    #Environment
+    "env_name"  :"Gym-v0",
+    "workspace" :"table_nico",
+    "engine"    :"pybullet",
+    "render"    :"opengl",
+    "seed"      :1,
+    "camera"    :0,
+    "gui"       :0,
+    "visualize" :0,
+    "visgym"    :0,
+    #Robot;
+    "robot"         :"nico_grasp",
+    "robot_action"  :"joints_gripper",
+    "robot_init"    :[0.5, 0.2, 0.4],
+    "max_velocity"  :3,
+    "max_force"     :200,
+    "action_repeat" :1,
+    #Task
+    "task_type"             :"A",
+    "natural_language"      :0,
+    "task_objects"          :[{"init":{"obj_name":"null"},
+                            "goal":{"obj_name":"towertarget","fixed":0,"rand_rot":0, "sampling_area":[-1.5, 1.5, 0.2, 1.5, 0.2, 0.2]}}],
+    "color_dict"            : {"apple":["green"], "target":["gray"]},
+    "used_objects"          :{"num_range":[0,0], "obj_list":[]},
+    // Observation
+    // actual_state options (pick one): "endeff_xyz", "endeff_6D" (robot end effector), "obj_xyz", "obj_6D", "vae", "yolact", "voxel" or "dope"
+    // goal_state options (pick one): "obj_xyz", "obj_6D", "vae", "yolact", "voxel" or "dope"
+    // additional_obs options (pick none/one/more): "joints_xyz", "joints_angles", "endeff_xyz", "endeff_6D", "touch", "distractor"
+    "observation"           : {"actual_state":"obj_6D", "goal_state":"obj_6D", "additional_obs":["endeff_xyz", "moving_target_vel"]},
+    #Distractor
+    "distractors"           : {"list":null, "moveable":1, "constant_speed":0, "movement_dims":3,
+                                       "movement_endpoints":[-0.3, 0.3, 0.4, 0.7, 0.1, 0.3]},
+
+    // Maybe I could have just used Distractors and bound the goal instead???
+    #Moving Targets
+    "moving_target"         : {
+                                "list": ["towertarget"],               
+                                "moveable": 1,
+                                "constant_speed": 1,
+                                "movement_dims": 2,
+                                "movement_endpoints": [-0.5, 0.5, -0.2, 0.6, 0.22, 0.22], // where targets bounce of
+                                "reach_bounds": [-0.4, 0.4, 0.1, 0.5],                  // robot reach rectangle
+                                "speed_range": [0.06, 0.30],                            // min/max speed (m/s approx)
+                                "bind_goal": 1  
+                                },
+
+
+    #Reward
+    "distance_type" :"euclidean",
+    "vae_path"      :null,
+    "yolact_path"   :null,
+    "yolact_config" :null,
+    #Train
+    "train_framework"   :"pytorch",
+    "algo"              :"ppo",
+    "max_episode_steps" :1000,
+    "steps"             :100000,
+    // test pretrained: "/Users/Leonie/Desktop/Robot_Nico_Project/Project/myGym/myGym/trained_models/nico_grasp/A/joints_gripper_ppo"
+    "pretrained_model"  :null,
+    "multiprocessing"   :null,
+    #Evaluation
+    "eval_freq"     :500000,
+    "eval_episodes" :50,
+    #Saving and logging
+    "record"    :0
+    }

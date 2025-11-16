@@ -116,6 +116,9 @@ class Robot:
         """
         Load SDF or URDF model of specified robot and place it in the environment to specified position and orientation
         """
+        root = pkg_resources.files("myGym")
+        rel = self.robot_path.lstrip("/\\")        # strip leading / or \
+        full = os.path.join(root, rel)
         if self.robot_path[-3:] == 'sdf':
             objects = self.p.loadSDF(
                os.path.join(pkg_resources.files("myGym"), self.robot_path))

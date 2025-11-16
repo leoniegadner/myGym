@@ -80,6 +80,7 @@ def configure_env(arg_dict, model_logdir=None, for_train=True):
                      "task_objects": arg_dict["task_objects"], "observation": arg_dict["observation"],
                      "framework": "SB3",
                      "distractors": arg_dict["distractors"],
+                     "moving_target": arg_dict.get("moving_target", None),
                      "num_networks": arg_dict.get("num_networks", 1),
                      "network_switcher": arg_dict.get("network_switcher", "gt"),
                      "distance_type": arg_dict["distance_type"], "used_objects": arg_dict["used_objects"],
@@ -542,6 +543,20 @@ def get_parser():
                              "of the given type, save it to the predefined file (for communication with other scripts) "
                              "and exit the program (without the actual training taking place). Expected values are \"description\" "
                              "(generate a task description) or \"new_tasks\" (generate new tasks)")
+    
+    # Moving target (optional)
+    parser.add_argument("--moving_target", type=int, help="Enable moving target (1) or disable (0)")
+    parser.add_argument("--moving_target_urdf", type=str, help="URDF filename used for the moving target")
+    parser.add_argument("--moving_target_bounds", nargs="*", type=float,
+                        help="Workspace [x_low x_high y_low y_high]")
+    parser.add_argument("--moving_target_reach_bounds", nargs="*", type=float,
+                        help="Robot reach [x_low x_high y_low y_high]")
+    parser.add_argument("--moving_target_speed_range", nargs="*", type=float,
+                        help="Speed range [vmin vmax]")
+    parser.add_argument("--moving_target_z", type=float, help="Fixed Z of moving target")
+    parser.add_argument("--moving_target_hit_time_window", nargs="*", type=float,
+                        help="Time window [tmin tmax] to guarantee a pass through reach area")
+
     return parser
 
 

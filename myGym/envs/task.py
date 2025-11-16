@@ -113,7 +113,23 @@ class TaskModule():
             elif key == "distractor":
                 poses = [self.vision_module.get_obj_position(self.env.task_objects["distractor"][x],\
                                     self.image, self.depth) for x in range(len(self.env.task_objects["distractor"]))]
-                info["additional_obs"]["distractor"] = [p for sublist in poses for p in sublist]
+                info["additional_obs"]["distractor"] = [p for sublist in poses for p in sublist]  
+            
+            elif key == "moving_target_vel":
+                vels = []
+                targets = self.env.get_moving_targets() if hasattr(self.env, "get_moving_targets") else []
+                k = 3 if getattr(self.env.moving_target, "distractor_movement_dimensions", 2) == 3 else 2
+
+                for obj in targets:
+                    v = self.env.moving_target.get_velocity_for(obj)  # np.array of len k
+                    if k == 2 and v.shape[0] == 3:
+                        v = v[:2]
+                    elif k == 3 and v.shape[0] == 2:
+                        v = np.array([v[0], v[1], 0.0], dtype=float)
+                    vels.extend([float(x) for x in v])
+
+                info["additional_obs"]["moving_target_vel"] = vels
+
         return info
 
     def get_observation(self):
@@ -570,6 +586,14 @@ class TaskModule():
             self.env.robot.reset_up()
             #self.goal_image = self.vision_module.vae_generate_sample()
 
+    def _moving_target_obs_dim(self):
+        env = self.env
+        if not hasattr(env, "has_moving_target") or not env.has_moving_target:
+            return 0
+        n_targets = 1 if env.moving_target_cfg.get("bind_goal", 0) else len(env.moving_target_cfg.get("list", []))
+        k = 3 if getattr(env.moving_target, "distractor_movement_dimensions", 2) == 3 else 2
+        return n_targets * k
+
     def check_obs_template(self):
         """
         Checks if observations are set according to rules and computes observation dim
@@ -581,8 +605,9 @@ class TaskModule():
         assert "actual_state" and "goal_state" in t.keys(), \
             "Observation setup in config must contain actual_state and goal_state"
         if t["additional_obs"]:
-            assert [x in ["joints_xyz", "joints_angles", "endeff_xyz", "endeff_6D", "touch", "distractor"] for x in
-                    t["additional_obs"]], "Failed to parse some of the additional_obs in config"
+            assert [x in ["joints_xyz", "joints_angles", "endeff_xyz", "endeff_6D",
+                        "touch", "distractor", "moving_target_vel"] for x in t["additional_obs"]], \
+                "Failed to parse some of the additional_obs in config"
         assert t["actual_state"] in ["endeff_xyz", "endeff_6D", "obj_xyz", "obj_6D", "vae", "yolact", "voxel", "dope"],\
             "failed to parse actual_state in Observation config"
         assert t["goal_state"] in ["obj_xyz", "obj_6D", "vae", "yolact", "voxel" or "dope"],\
@@ -598,13 +623,15 @@ class TaskModule():
                 [self.obs_template["additional_obs"].remove(x) for x in t["additional_obs"] if "endeff" in x]
         obsdim = 0
         for x in [t["actual_state"], t["goal_state"]]:
+            mt_len = self._moving_target_obs_dim()
             get_datalen = {"joints_xyz":len(self.get_linkstates_unpacked()),
                            "joints_angles":len(self.env.robot.get_joints_states()),
                            "endeff_xyz":len(self.vision_module.get_obj_position(self.env.robot, self.image, self.depth)[:3]),
                            "endeff_6D":len(list(self.vision_module.get_obj_position(self.env.robot, self.image, self.depth)) \
                                                       + list(self.vision_module.get_obj_orientation(self.env.robot))),
                            "dope":7, "obj_6D":7, "distractor": 3, "touch":1, "yolact":3, "voxel":3, "obj_xyz":3,
-                           "vae":self.vision_module.obsdim}
+                           "vae":self.vision_module.obsdim,
+                           "moving_target_vel": mt_len}
             obsdim += get_datalen[x]
         for x in t["additional_obs"]:
             obsdim += get_datalen[x]

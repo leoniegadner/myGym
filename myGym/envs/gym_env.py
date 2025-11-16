@@ -3,6 +3,7 @@ from typing import List, Any
 
 from myGym.envs import robot, env_object
 from myGym.envs import task as t
+from myGym.envs.moving_target import MovingTargetModule 
 from myGym.envs import distractor as d
 from myGym.envs.base_env import CameraEnv
 from collections import ChainMap
@@ -85,6 +86,7 @@ class GymEnv(CameraEnv):
                  num_networks=1,
                  network_switcher="gt",
                  distractors=None,
+                 moving_target=None,
                  reward='distance',
                  distance_type='euclidean',
                  active_cameras=None,
@@ -118,7 +120,7 @@ class GymEnv(CameraEnv):
         self.action_repeat          = action_repeat
         self.color_dict             = color_dict
         self.task_type              = task_type
-        self.task_objects_dict     = task_objects
+        self.task_objects_dict      = task_objects
         self.framework = framework
         self.task_objects = []
         self.env_objects = []
@@ -132,6 +134,25 @@ class GymEnv(CameraEnv):
         self.unwrapped.reward = reward
         self.dist = d.DistractorModule(distractors["moveable"], distractors["movement_endpoints"],
                                        distractors["constant_speed"], distractors["movement_dims"], env=self)
+        
+        # Moving target (your own module, but same-shaped dict as distractors)
+        self.has_moving_target = bool(moving_target and moving_target.get("list"))
+        self.moving_target_cfg = moving_target or {"list": None}
+
+        self.moving_target = MovingTargetModule(
+            moveable=self.moving_target_cfg.get("moveable", 1),
+            movement_endpoints=self.moving_target_cfg.get(
+                "movement_endpoints",
+                [-0.58, 0.55, -0.35, 0.35, 0.20, 0.20]
+            ),
+            constant_speed=self.moving_target_cfg.get("constant_speed", 1),
+            movement_dims=self.moving_target_cfg.get("movement_dims", 2),
+            env=self,
+            reach_bounds=tuple(self.moving_target_cfg.get("reach_bounds", (-0.30, 0.30, -0.25, 0.25))),
+            speed_range=tuple(self.moving_target_cfg.get("speed_range", (0., 0.30))),
+            dt=getattr(self, "timestep", 0.02),
+        )
+
         self.dataset   = dataset
         self.obs_space = obs_space
         self.visualize = visualize
@@ -462,7 +483,7 @@ class GymEnv(CameraEnv):
                 self.env_objects = {"env_objects": other_objects + self._randomly_place_objects(self.used_objects)}
 
                 # will set the task and the reward
-                self._set_observation_space()
+                self._set_observation_space()      
         if only_subtask:
             if self.task.current_task < (len(self.task_objects_dict)) and not self.nl_mode:
                 self.shift_next_subtask()
@@ -476,6 +497,31 @@ class GymEnv(CameraEnv):
                 self.task_objects["distractor"].extend(distrs)
             else:
                 self.task_objects["distractor"] = distrs
+        
+        self.env_objects.setdefault("moving_target", [])
+        self.env_objects["moving_target"].clear()
+
+        if self.has_moving_target:
+            mts = []
+            if self.moving_target_cfg.get("bind_goal", 0):
+                goal_obj = self.task_objects["goal_state"]
+                mts = [goal_obj]
+                self.moving_target.reset_velocity_cache()
+                self.moving_target._ensure_step_for(goal_obj)  # sample now
+                self.moving_target_cfg["list"] = [goal_obj.name]
+            else:
+                self.moving_target.reset_velocity_cache()
+                for name in self.moving_target_cfg.get("list", []):
+                    mts.append(self.moving_target.place_target(name, self.p, self.task_objects["goal_state"].get_position()))
+            self.env_objects["moving_target"] = mts
+
+        # ---- settle pose, then sample velocity for the *bound* object(s)
+        self.p.stepSimulation()                      # make sure transforms are valid
+        if hasattr(self, "moving_target"):
+            self.moving_target.reset_velocity_cache()
+            for obj in self.env_objects.get("moving_target", []):
+                self.moving_target.resample_velocity(obj)  
+
         self.env_objects = {**self.task_objects, **self.env_objects}
         self.task.reset_task()
         self.unwrapped.reward.reset()
@@ -523,7 +569,15 @@ class GymEnv(CameraEnv):
         for cam_idx in range(len(camera_args['position'])):
             self.add_camera(position=camera_args['position'][cam_idx], target_position=camera_args['target'][cam_idx],
                             distance=0.001, is_absolute_position=True)
+    
+    def get_moving_targets(self):
+        """Returns list of all active moving targets"""
+        return self.env_objects.get("moving_target", [])
 
+    def get_target_positions(self):
+        """Returns current positions of all moving targets"""
+        return [target.get_position() for target in self.get_moving_targets()]
+    
     def get_observation(self):
         """
         Get observation data from the environment
@@ -553,6 +607,9 @@ class GymEnv(CameraEnv):
         """
         self._apply_action_robot(action)
         if self.has_distractor: [self.dist.execute_distractor_step(d) for d in self.distractors["list"]]
+        
+        if self.has_moving_target and self.moving_target_cfg["list"]:
+            [self.moving_target.execute_target_step(name) for name in self.moving_target_cfg["list"]]
         self._observation = self.get_observation()
         if self.dataset:
             reward, terminated, truncated, info = 0, False, False, {}
