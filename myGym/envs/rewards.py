@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 # from stable_baselines import results_plotter
 import os
 import math
+import copy
 from math import sqrt, fabs, exp, pi, asin
 from myGym.utils.vector import Vector
 import random
@@ -47,6 +48,38 @@ class Reward:
 
     def compute(self, observation=None):
         raise NotImplementedError
+
+    def compute_planning(self, observation=None):
+        """
+        Stateless reward evaluation used for model-based planning.
+        It avoids mutating the live env or reward state and suppresses termination flags
+        so planning rollouts can't accidentally end the real episode.
+        """
+        if observation is None:
+            return 0.0
+
+        # Keep planning stateless: do not touch reward internals or env flags beyond a temporary marker.
+        prev_rollout_flag = getattr(self.env, "in_model_rollout", False)
+        self.env.in_model_rollout = True
+        try:
+            goal = observation["goal_state"]
+            obj = observation["actual_state"]
+            dist_obj_goal = self.task.calc_distance(goal, obj)
+
+            # If gripper info is available, encourage both object-goal proximity and gripper-object proximity.
+            additional = observation.get("additional_obs", {}) or {}
+            gripper = additional.get("endeff_xyz")
+            if gripper is None and "endeff_6D" in additional:
+                gripper = additional["endeff_6D"][:3]
+
+            if gripper is not None:
+                dist_gripper_obj = self.task.calc_distance(gripper, obj)
+                reward = -(dist_obj_goal + 0.3 * dist_gripper_obj)
+            else:
+                reward = -dist_obj_goal
+            return float(reward)
+        finally:
+            self.env.in_model_rollout = prev_rollout_flag
 
     def reset(self):
         raise NotImplementedError
@@ -177,6 +210,9 @@ class Protorewards(Reward):
         return final_distance
 
     def get_positions(self, observation):
+        if observation is not None and not getattr(self.env, "in_model_rollout", False):
+            # Keep task._observation in sync with the real observation passed to compute
+            self.task._observation = copy.deepcopy(observation)
         goal_position = observation["goal_state"]
         object_position = observation["actual_state"]
         # gripper_name = [x for x in self.env.task.obs_template["additional_obs"] if "endeff" in x][0]

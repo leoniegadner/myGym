@@ -13,6 +13,7 @@ from stable_baselines3.common.results_plotter import load_results, ts2xy
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor, VecEnv, sync_envs_normalization
 from tqdm.auto import tqdm
 from myGym.utils.helpers import PrintEveryNCalls
+from myGym.utils.save_utils import uses_sb3_style
 import time
 
 np.set_printoptions(suppress = True)
@@ -789,7 +790,10 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
         # DOESNT WORK WITH MULTIPROCESSING (?)
         if actual_calls >= self.save_model_every_steps*self.num_evals: #Saving model just before evaluation
             print("Saving model to {}".format(self.periodical_save_path))
-            self.model.save(self.periodical_save_path, steps = actual_calls + self.starting_steps)
+            if uses_sb3_style(self.algo):
+                self.model.save(self.periodical_save_path, steps = actual_calls + self.starting_steps)
+            else:
+                self.model.save(f"{self.periodical_save_path}_{actual_calls + self.starting_steps}")
             self.num_evals += 1
         if self.n_calls % self.check_freq == 0:
             # Retrieve training reward
@@ -802,7 +806,10 @@ class SaveOnBestTrainingRewardCallback(BaseCallback):
                 # Save the new best model (with the best average reward)
                 if average_reward > self.best_average_reward:
                     self.best_average_reward = average_reward
-                    self.model.save(self.save_path, steps = self.starting_steps + actual_calls, best = True)
+                    if uses_sb3_style(self.algo):
+                        self.model.save(self.save_path, steps = self.starting_steps + actual_calls, best = True)
+                    else:
+                        self.model.save(f"{self.periodical_save_path}_best_{actual_calls + self.starting_steps}")
                 if self.engine == "mujoco":  # Mujoco has additional prints
                     # Temporal workaround multiprocessing
                     if not self.num_cpu==1 and self.verbose > 0:
@@ -986,7 +993,6 @@ class SaveOnTopRewardCallback(BaseCallback):
                         submodel.save(self.save_path, i)
                     i += 1
         return True
-
 
 
 

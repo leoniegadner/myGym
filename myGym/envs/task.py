@@ -332,7 +332,10 @@ class TaskModule():
         """
         Check if goal of the task was completed successfully
         """
-        
+        # Skip side effects during model-based rollouts (e.g., PETS planning)
+        if getattr(self.env, "in_model_rollout", False):
+            return False
+            
         finished = None
         if self.task_type in ['A','AG','AGM','AGMD','AGMDW','AGTDW']: #all tasks ending with R (FMR) have to have distrot checker
             finished = self.check_distance_threshold(self._observation)  
@@ -366,12 +369,20 @@ class TaskModule():
             self.end_episode_fail("Vision fails repeatedly")
 
     def end_episode_fail(self, message):
+        # Avoid mutating real env state during model-based rollouts (e.g., PETS planning)
+        if getattr(self.env, "in_model_rollout", False):
+            return
+        self._log_final_distance()
         self.env.episode_truncated= True
         self.env.episode_failed = True
         self.env.episode_info = message
         self.env.robot.release_all_objects()
 
     def end_episode_success(self):
+        # Avoid mutating real env state during model-based rollouts (e.g., PETS planning)
+        if getattr(self.env, "in_model_rollout", False):
+            return
+        self._log_final_distance()
         if self.current_task == (self.number_tasks-1):
             self.env.episode_terminated = True
             self.env.robot.release_all_objects()

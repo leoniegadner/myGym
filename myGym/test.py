@@ -457,13 +457,25 @@ def test_model(
 ) -> None:
     env.reset()
     try:
+        load_kwargs = {}
+        combo_kwargs = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][2] if len(
+            implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]]) > 2 else {}
+
+        # MBRLWrapper.load needs the cfg builder/algo name to rebuild the planner and dynamics.
+        if arg_dict["algo"] in ["pets", "mbpo", "planet"] and isinstance(combo_kwargs, dict):
+            for key in ["cfg_builder", "algo_name"]:
+                if key in combo_kwargs:
+                    load_kwargs[key] = combo_kwargs[key]
+            if "device" in arg_dict:
+                load_kwargs["device"] = arg_dict["device"]
+
         #TODO: maybe this if else is unnecessary?
         if "multi" in arg_dict["algo"]:
             model_args = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][1]
             model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(arg_dict["pretrained_model"], env = env)
             model.env = model_args[1].env
         else:
-            model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(arg_dict["pretrained_model"], env = env)
+            model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(arg_dict["pretrained_model"], env=env, **load_kwargs)
     except:
         if (arg_dict["algo"] in implemented_combos.keys()) and (
                 arg_dict["train_framework"] not in list(implemented_combos[arg_dict["algo"]].keys())):
@@ -474,6 +486,18 @@ def test_model(
         else:
             err = "invalid model_path argument"
         raise Exception(err)
+
+    # Optionally override mimic usage with current arguments (test-time switch)
+    if arg_dict["algo"] in ["pets", "mbpo", "planet"] and hasattr(model, "use_mimic_policy"):
+        if "pets_mimic_use_policy" in arg_dict:
+            model.use_mimic_policy = bool(arg_dict["pets_mimic_use_policy"])
+            if hasattr(model, "arg_dict"):
+                model.arg_dict["pets_mimic_use_policy"] = model.use_mimic_policy
+        if model.use_mimic_policy and getattr(model, "policy_mimic", None) is None:
+            try:
+                model._maybe_load_policy_mimic(env.observation_space.shape, env.action_space.shape)
+            except Exception:
+                pass
 
     images = []  # Empty list for GIF images
     video_path = None
@@ -557,6 +581,8 @@ def main() -> None:
     parser.add_argument("-ns", "--network_switcher", default="gt", help="How does a robot switch to next network (gt or keyboard)")
     parser.add_argument("-rr", "--results_report", default = False, help="Used only with oraculum - shows report of task feasibility at the end.")
     parser.add_argument("-tp", "--top_grasp",  default = False, help="Use top grasp when reaching objects with oraculum.")
+    parser.add_argument("--pets_mimic_use_policy", action="store_true",
+                        help="If set, use the trained PETS policy mimic (single forward pass) instead of the planner when available.")
     # parser.add_argument("-nl", "--natural_language", default=False, help="NL Valid arguments: True, False")
     arg_dict, commands = get_arguments(parser)
     parameters = {}

@@ -35,6 +35,7 @@ try:
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.utils import set_random_seed
+    from stable_baselines3.common.callbacks import BaseCallback
 except Exception as e:
     print(e)
 
@@ -43,12 +44,18 @@ try:
 except:
     print("Torch isn't probably installed correctly")
 
+from myGym.mbrl_mygym.mbrl_wrapper import MBRLWrapper
+from myGym.utils.callbacksMBRL import MBRLEvalCallback
+from omegaconf import OmegaConf
+
+
 # Import helper classes and functions for monitoring
 from myGym.utils.callbacksSB3 import SaveOnBestTrainingRewardCallback, MultiPPOEvalCallback, PPOEvalCallback
 from myGym.envs.natural_language import NaturalLanguage
 from myGym.stable_baselines_mygym.multi_ppo_SB3 import MultiPPOSB3
 from myGym.stable_baselines_mygym.ppoSB3 import PPO as PPO_P
 from myGym.stable_baselines_mygym.Subproc_vec_envSB3 import SubprocVecEnv
+from myGym.utils.save_utils import uses_sb3_style
 
 # This is a global variable for the type of engine we are working with
 AVAILABLE_SIMULATION_ENGINES = ["pybullet"]
@@ -83,7 +90,7 @@ def configure_env(arg_dict, model_logdir=None, for_train=True):
                      "natural_language": bool(arg_dict["natural_language"]),
                      "training": bool(for_train), "top_grasp": arg_dict["top_grasp"],
                      "max_ep_steps": arg_dict["max_episode_steps"],
-                     "gui_on": arg_dict["gui"]
+                     "gui_on": arg_dict["gui"],                     
                      }
 
     if "network_switcher" in arg_dict.keys():
@@ -128,12 +135,49 @@ def make_env(arg_dict: dict, rank: int, seed: int = 0, model_logdir=None) -> Cal
 
 
 def configure_implemented_combos(env, model_logdir, arg_dict):
-    implemented_combos = {"ppo": {}, "sac": {}, "td3": {}, "a2c": {}, "multippo": {}}
+    implemented_combos = {"ppo": {}, "sac": {}, "td3": {}, "a2c": {}, "multippo": {}, 
+                          "pets": {}, "mbpo": {}, "planet": {}} # mbrl
+
+    # populate action bounds for MBRL agents if available
+    # TODO: move this somewhere less hacky.
+    if env and hasattr(env, "action_space") and hasattr(env.action_space, "low"):
+        arg_dict.setdefault("action_lb", env.action_space.low.tolist())
+        arg_dict.setdefault("action_ub", env.action_space.high.tolist())
+
+    sac_policy = arg_dict.get("sac_policy", "MlpPolicy")
+    auto_ent = bool(arg_dict.get("sac_automatic_entropy_tuning", True))
+    sac_kwargs = {
+        "verbose": 1,
+        "tensorboard_log": model_logdir,
+        "learning_rate": arg_dict.get("sac_lr", 3e-4),
+        "buffer_size": arg_dict.get("sac_buffer_size", 1_000_000),
+        "learning_starts": arg_dict.get("sac_learning_starts", 100),
+        "batch_size": arg_dict.get("sac_batch_size", 256),
+        "tau": arg_dict.get("sac_tau", 0.005),
+        "gamma": arg_dict.get("sac_gamma", 0.99),
+        "train_freq": arg_dict.get("sac_train_freq", 1),
+        "gradient_steps": arg_dict.get("sac_gradient_steps", 1),
+        "ent_coef": "auto" if auto_ent else arg_dict.get("sac_alpha", 0.2),
+        "target_update_interval": arg_dict.get("sac_target_update_interval", 1),
+        "use_sde": bool(arg_dict.get("sac_use_sde", False)),
+        "sde_sample_freq": arg_dict.get("sac_sde_sample_freq", -1),
+        "use_sde_at_warmup": bool(arg_dict.get("sac_use_sde_at_warmup", False)),
+        "optimize_memory_usage": bool(arg_dict.get("sac_optimize_memory_usage", False)),
+        "policy_kwargs": arg_dict.get("sac_policy_kwargs", None),
+        "device": arg_dict.get("device", "auto"),
+    }
+    if auto_ent:
+        sac_kwargs["target_entropy"] = arg_dict.get("sac_target_entropy", "auto")
+    implemented_combos["sac"]["pytorch"] = [SAC_P, (sac_policy, env), sac_kwargs]
+
+    mbrl_args = (None, env, model_logdir, arg_dict)
+    implemented_combos["pets"]["pytorch"] = [MBRLWrapper, mbrl_args, {"algo_name": "pets", "cfg_builder": build_mbrl_cfg}]
+    implemented_combos["mbpo"]["pytorch"] = [MBRLWrapper, mbrl_args, {"algo_name": "mbpo", "cfg_builder": build_mbrl_cfg}]
+    implemented_combos["planet"]["pytorch"] = [MBRLWrapper, mbrl_args, {"algo_name": "planet", "cfg_builder": build_mbrl_cfg}]
 
     implemented_combos["ppo"]["pytorch"] = [PPO_P, ('MlpPolicy', env),
                                             {"n_steps": arg_dict["algo_steps"], "verbose": 1, "tensorboard_log": model_logdir,
                                              "device": "cpu"}]
-    implemented_combos["sac"]["pytorch"] = [SAC_P, ('MlpPolicy', env), {"verbose": 1, "tensorboard_log": model_logdir}]
     implemented_combos["td3"]["pytorch"] = [TD3_P, ('MlpPolicy', env), {"verbose": 1, "tensorboard_log": model_logdir}]
     implemented_combos["a2c"]["pytorch"] = [A2C_P, ('MlpPolicy', env), {"n_steps": arg_dict["algo_steps"], "verbose": 1,
                                                                         "tensorboard_log": model_logdir}]
@@ -141,7 +185,6 @@ def configure_implemented_combos(env, model_logdir, arg_dict):
                                                  {"n_steps": arg_dict["algo_steps"], "verbose": 1, "tensorboard_log": model_logdir,
                                                   "device": "cpu", "n_models": arg_dict["num_networks"]}]
     return implemented_combos
-
 
 def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None):
     model_name = arg_dict["algo"] + '_' + str(arg_dict["steps"])
@@ -177,7 +220,9 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
             vec_env = DummyVecEnv([lambda: env])
         else:
             vec_env = env
-        model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(pretrained_model, vec_env, device = "cpu")
+        
+        model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(
+                pretrained_model, vec_env, device="cpu", **model_kwargs)
     else:
         model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0](*model_args, **model_kwargs)
 
@@ -214,7 +259,21 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
                                                n_eval_episodes=arg_dict["eval_episodes"],
                                                record=arg_dict["record"],
                                                camera_id=arg_dict["camera"], num_cpu=NUM_CPU, starting_steps = steps)
-        else:
+    
+        
+        elif arg_dict["algo"] in ["pets", "mbpo", "planet"]:
+            eval_callback = MBRLEvalCallback(
+                eval_env, log_path=model_logdir,
+                eval_freq=arg_dict["eval_freq"],
+                n_eval_episodes=arg_dict["eval_episodes"],
+                deterministic=True,
+                replay_buffer=getattr(model, "replay_buffer", None),
+                verbose=1,
+                starting_steps=steps,
+                num_cpu=NUM_CPU,
+            )
+        
+        else: 
             eval_callback = PPOEvalCallback(eval_env, log_path=model_logdir,
                                            eval_freq=arg_dict["eval_freq"],
                                            algo_steps=arg_dict["algo_steps"],
@@ -225,7 +284,11 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
     print("learn started")
     model.learn(total_timesteps=arg_dict["steps"], callback=callbacks_list)
     print("learn ended")
-    model.save(model_logdir, steps = steps + model.num_timesteps)
+    if uses_sb3_style(arg_dict["algo"]):
+        model.save(model_logdir, steps = steps + model.num_timesteps)
+    else:
+        model.save(f"{model_logdir}_{steps + model.num_timesteps}")
+
     env.close()
     print("Training time: {:.2f} s".format(time.time() - start_time))
     print("Training steps: {:} s".format(model.num_timesteps))
@@ -235,6 +298,167 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
     if arg_dict["engine"] == "pybullet":
         save_results(arg_dict, model_name, env, model_logdir)
     return model
+
+def build_mbrl_cfg(arg_dict):
+    batch_size = arg_dict.get("mbrl_batch_size", 256)
+    val_ratio = arg_dict.get("validation_ratio", 0.05)
+    cem_num_samples = arg_dict.get("cem_num_samples", 400)
+    cem_num_elites = arg_dict.get("cem_num_elites", 40)
+    cem_num_iters = arg_dict.get("cem_num_iters", 5)
+    cem_alpha = arg_dict.get("cem_alpha", 0.1)
+    cem_clipped_normal = arg_dict.get("cem_clipped_normal", False)
+    default_learned_rewards = arg_dict.get("mbrl_learned_rewards", arg_dict.get("algo") == "mbpo")
+    real_ratio = arg_dict.get("real_ratio", 0.0) or 0.0
+
+    device = arg_dict.get("device", "cpu")
+    cem_elite_ratio = (cem_num_elites / float(cem_num_samples)) if cem_num_samples else 0.1
+    optimizer_choice = str(arg_dict.get("mbrl_optimizer", "cem")).lower()
+
+    if optimizer_choice == "cem":
+        optimizer_cfg = {
+            "_target_": "mbrl.planning.CEMOptimizer",
+            "num_iterations": cem_num_iters,
+            "population_size": cem_num_samples,
+            "elite_ratio": cem_elite_ratio,
+            "alpha": cem_alpha,
+            "return_mean_elites": True,
+            "clipped_normal": cem_clipped_normal,
+            "device": device,
+        }
+    elif optimizer_choice == "icem":
+        icem_num_iters = arg_dict.get("icem_num_iters", cem_num_iters)
+        icem_population_size = arg_dict.get("icem_population_size", cem_num_samples)
+        icem_elite_ratio = arg_dict.get("icem_elite_ratio", cem_elite_ratio)
+        icem_population_decay_factor = arg_dict.get("icem_population_decay_factor", 1.25)
+        icem_colored_noise_exponent = arg_dict.get("icem_colored_noise_exponent", 2.0)
+        icem_keep_elite_frac = arg_dict.get("icem_keep_elite_frac", 0.1)
+        icem_alpha = arg_dict.get("icem_alpha", cem_alpha)
+        icem_return_mean_elites = arg_dict.get("icem_return_mean_elites", True)
+        icem_population_size_module = arg_dict.get("icem_population_size_module", None)
+
+        optimizer_cfg = {
+            "_target_": "mbrl.planning.ICEMOptimizer",
+            "num_iterations": icem_num_iters,
+            "population_size": icem_population_size,
+            "elite_ratio": icem_elite_ratio,
+            "population_decay_factor": icem_population_decay_factor,
+            "colored_noise_exponent": icem_colored_noise_exponent,
+            "keep_elite_frac": icem_keep_elite_frac,
+            "alpha": icem_alpha,
+            "return_mean_elites": icem_return_mean_elites,
+            "device": device,
+        }
+        if icem_population_size_module is not None:
+            optimizer_cfg["population_size_module"] = icem_population_size_module
+    elif optimizer_choice == "mppi":
+        mppi_num_iters = arg_dict.get("mppi_num_iters", 5)
+        mppi_population_size = arg_dict.get("mppi_num_samples", cem_num_samples)
+        mppi_gamma = arg_dict.get("mppi_gamma", arg_dict.get("mppi_lambda", 1.0))
+        mppi_sigma = arg_dict.get("mppi_sigma", 1.0)
+        mppi_beta = arg_dict.get("mppi_beta", 0.1)
+
+        optimizer_cfg = {
+            "_target_": "mbrl.planning.MPPIOptimizer",
+            "num_iterations": mppi_num_iters,
+            "population_size": mppi_population_size,
+            "gamma": mppi_gamma,
+            "sigma": mppi_sigma,
+            "beta": mppi_beta,
+            "device": device,
+        }
+    else:
+        raise ValueError(
+            f"Unknown mbrl_optimizer '{optimizer_choice}'. Use 'cem', 'icem', or 'mppi'."
+        )
+
+    base = {
+        "seed": arg_dict.get("seed", 0),
+        "device": "cpu",
+        "algorithm": {
+            "initial_exploration_steps": arg_dict.get("mbrl_init_random", 1000),
+            "freq_train_model": arg_dict.get("mbrl_train_freq", 250),
+            "num_particles": arg_dict.get("mbrl_num_particles", 20),
+            "learned_rewards": bool(default_learned_rewards),
+            "target_is_delta": True,
+            "normalize": True,
+            "num_eval_episodes": int(arg_dict.get("num_eval_episodes", 1)),
+            "agent": {
+                "_target_": "mbrl.planning.TrajectoryOptimizerAgent",
+                "action_lb": arg_dict.get("action_lb", []),
+                "action_ub": arg_dict.get("action_ub", []),
+                "planning_horizon": arg_dict.get("mbrl_planning_horizon", 20),
+                "replan_freq": 1,
+                "verbose": False,
+                "optimizer_cfg": optimizer_cfg,
+            },
+        },
+        "log_frequency_agent": arg_dict.get("log_frequency_agent", 1000),
+        "dynamics_model": {
+            "_target_": "mbrl.models.GaussianMLP",
+            "ensemble_size": arg_dict.get("ensemble_size", 5),
+            "hid_size": arg_dict.get("mbrl_hid_size", 200),
+            "num_layers": arg_dict.get("mbrl_num_layers", 4),
+            "propagation_method": arg_dict.get("mbrl_propagation_method", "fixed_model"),
+            "device": arg_dict.get("device", "cpu"),
+        },
+        "overrides": {
+            "num_steps": arg_dict["steps"],
+            "batch_size": batch_size,
+            "model_batch_size": batch_size,
+            "model_lr": arg_dict.get("mbrl_model_lr", 1e-3),
+            "model_wd": arg_dict.get("mbrl_model_wd", 1e-4),
+            "validation_ratio": val_ratio,
+        },
+    }
+    if arg_dict["algo"] == "mbpo":
+        # SAC agent config (shapes and bounds will be completed at runtime).
+        base["algorithm"]["agent"] = {
+            "_target_": "mbrl.third_party.pytorch_sac_pranz24.sac.SAC",
+            "num_inputs": "???",
+            "action_space": {
+                "_target_": "gymnasium.spaces.Box",
+                "low": "???",
+                "high": "???",
+                "shape": "???",
+                "dtype": "float32",
+            },
+            "args": {
+                "gamma": arg_dict.get("sac_gamma", 0.99),
+                "tau": arg_dict.get("sac_tau", 0.005),
+                "alpha": arg_dict.get("sac_alpha", 0.2),
+                "policy": arg_dict.get("sac_policy", "Gaussian"),
+                "target_update_interval": arg_dict.get("sac_target_update_interval", 4),
+                "automatic_entropy_tuning": bool(arg_dict.get("sac_automatic_entropy_tuning", True)),
+                "target_entropy": arg_dict.get("sac_target_entropy", -0.05),
+                "hidden_size": arg_dict.get("sac_hidden_size", 256),
+                "device": arg_dict.get("device", "cpu"),
+                "lr": arg_dict.get("sac_lr", 3e-4),
+            },
+        }
+        base["algorithm"]["rollout_schedule"] = arg_dict.get("rollout_schedule", [1, 15, 1, 1])
+        base["algorithm"]["real_ratio"] = real_ratio
+        base["algorithm"]["real_data_ratio"] = real_ratio
+        base["algorithm"]["learned_rewards"] = True  # MBPO requires model-predicted rewards
+        base["overrides"].update({
+            "freq_train_model": arg_dict.get("mbrl_train_freq", 250),
+            "effective_model_rollouts_per_step": arg_dict.get("effective_model_rollouts_per_step", 400),
+            "rollout_schedule": arg_dict.get("rollout_schedule", [1, 15, 1, 1]),
+            "epoch_length": arg_dict.get("epoch_length", 1000),
+            "num_sac_updates_per_step": arg_dict.get("num_sac_updates_per_step", 20),
+            "sac_updates_every_steps": arg_dict.get("sac_updates_every_steps", 1),
+            "num_epochs_to_retain_sac_buffer": arg_dict.get("num_epochs_to_retain_sac_buffer", 1),
+            "sac_batch_size": arg_dict.get("sac_batch_size", batch_size),
+            "sac_gamma": arg_dict.get("sac_gamma", 0.99),
+            "sac_tau": arg_dict.get("sac_tau", 0.005),
+            "sac_alpha": arg_dict.get("sac_alpha", 0.2),
+            "sac_policy": arg_dict.get("sac_policy", "Gaussian"),
+            "sac_target_update_interval": arg_dict.get("sac_target_update_interval", 4),
+            "sac_automatic_entropy_tuning": bool(arg_dict.get("sac_automatic_entropy_tuning", True)),
+            "sac_target_entropy": arg_dict.get("sac_target_entropy", -0.05),
+            "sac_hidden_size": arg_dict.get("sac_hidden_size", 256),
+            "sac_lr": arg_dict.get("sac_lr", 3e-4),
+        })
+    return OmegaConf.create(base)
 
 
 def get_parser():
@@ -279,6 +503,24 @@ def get_parser():
     parser.add_argument("-s", "--steps", type=int, help="The number of steps to train")
     parser.add_argument("-ms", "--max_episode_steps", type=int,  help="The maximum number of steps per episode")
     parser.add_argument("-ma", "--algo_steps", type=int,  help="The number of steps per for algo training (PPO2,A2C)")
+    # MBRL common
+    parser.add_argument("-mbph", "--mbrl_planning_horizon", type=int, help="mbrl planning horizon")
+    parser.add_argument("-mbnp", "--mbrl_num_particles", type=int, help="particles for model rollout")
+    parser.add_argument("-mbir", "--mbrl_init_random", type=int, help="initial random steps")
+    parser.add_argument("-mbtf", "--mbrl_train_freq", type=int, help="steps between model updates")
+    parser.add_argument("-mbes", "--ensemble_size", type=int, help="dyn model ensemble size")
+    parser.add_argument("-mbhs", "--mbrl_hid_size", type=int, help="dyn model hidden size")
+    parser.add_argument("-mbnl", "--mbrl_num_layers", type=int, help="dyn model layers")
+    parser.add_argument("-mblr", "--mbrl_model_lr", type=float, help="dyn model lr")
+    parser.add_argument("-mbwd", "--mbrl_model_wd", type=float, help="dyn model weight decay")
+    parser.add_argument("-mbbs", "--mbrl_batch_size", type=int, help="model train batch size")
+    parser.add_argument("--mbrl_learned_rewards", action="store_true", help="learn reward in model")
+    # CEM/MPPI (used by PETS/MBPO)
+    parser.add_argument("-mbns", "--cem_num_samples", type=int, help="CEM population")
+    parser.add_argument("-mbne", "--cem_num_elites", type=int, help="CEM elites")
+    parser.add_argument("-mbte", "--cem_temperature", type=float, help="CEM temperature")
+    parser.add_argument("-mbpi", "--mppi_num_samples", type=int, help="MPPI samples")
+    parser.add_argument("-mbla", "--mppi_lambda", type=float, help="MPPI lambda")
     #Evaluation
     parser.add_argument("-ef", "--eval_freq", type=int,  help="Evaluate the agent every eval_freq steps")
     parser.add_argument("-e", "--eval_episodes", type=int,  help="Number of episodes to evaluate performance of the robot")
@@ -387,6 +629,15 @@ def main():
     arg_dict, commands = get_arguments(parser)
     args = parser.parse_args()
     arg_dict["top_grasp"] = False
+
+    # Defaults for optional PETS policy distillation
+    arg_dict.setdefault("pets_policy_mimic", False)
+    arg_dict.setdefault("pets_mimic_use_policy", arg_dict.get("pets_policy_mimic", False))
+    arg_dict.setdefault("pets_mimic_batch_size", 512)
+    arg_dict.setdefault("pets_mimic_epochs", 10)
+    arg_dict.setdefault("pets_mimic_hidden_sizes", [256, 256])
+    arg_dict.setdefault("pets_mimic_learning_rate", 1e-3)
+    arg_dict.setdefault("pets_mimic_val_split", 0.1)
 
     # for key, arg in arg_dict.items():
     #     if type(arg_dict[key]) == list:

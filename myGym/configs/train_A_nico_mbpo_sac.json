@@ -1,0 +1,106 @@
+{
+    # Environment
+    "env_name": "Gym-v0",
+    "workspace": "table_nico",
+    "engine": "pybullet",
+    "render": "opengl",
+    "seed": 1,
+    "camera": 0,
+    "gui": 0,
+    "visualize": 0,
+    "visgym": 0,
+    # Robot
+    "robot": "nico_grasp",
+    "robot_action": "joints_gripper",
+    "robot_init": [0.5, 0.2, 0.4],
+    "max_velocity": 3,
+    "max_force": 200,
+    "action_repeat": 1,
+    # Task
+    "task_type": "A",
+    "natural_language": 0,
+    "task_objects"          :[{"init":{"obj_name":"null"},
+                            "goal":{"obj_name":"towertarget","fixed":1,"rand_rot":0, "sampling_area":[0.1,0.4,0.25,0.45,0.1,0.3]}}],
+    "color_dict": { "apple": ["green"], "target": ["gray"] },
+    "used_objects": { "num_range": [0, 0], "obj_list": [] },
+    // Observation
+    "observation": { "actual_state": "obj_xyz", "goal_state": "obj_xyz", "additional_obs": ["endeff_xyz"] },
+    # Distractor
+    "distractors": { "list": null, "moveable": 1, "constant_speed": 0, "movement_dims": 3,
+                     "movement_endpoints": [-0.3, 0.3, 0.4, 0.7, 0.1, 0.3] },
+    # Reward
+    "distance_type": "euclidean",
+    "vae_path": null,
+    "yolact_path": null,
+    "yolact_config": null,
+    # Train
+    "train_framework": "pytorch",
+    "algo": "mbpo",
+    "max_episode_steps": 512,
+    "steps": 500000,
+    "pretrained_model": null,
+    "multiprocessing": null,
+    # MBRL / MBPO
+    "ensemble_size": 5,
+    "mbrl_batch_size": 256,
+    "mbrl_hid_size": 64,
+    "mbrl_num_layers": 3,
+    "mbrl_model_lr": 0.0003,
+    "mbrl_model_wd": 5e-5,
+    "validation_ratio": 0.2,
+    "mbrl_init_random": 5000,
+    "mbrl_train_freq": 250,
+    "real_ratio": 1,
+    "rollout_schedule": [20, 100, 1, 1],
+    "effective_model_rollouts_per_step": 400,
+    "epoch_length": 512,
+    "num_sac_updates_per_step": 20,
+    "sac_updates_every_steps": 1,
+    "num_epochs_to_retain_sac_buffer": 5,
+    "sac_batch_size": 256,
+    "sac_gamma": 0.99,
+    "sac_tau": 0.005,
+    "sac_alpha": 0.2,
+    "sac_policy": "Gaussian",
+    "sac_target_update_interval": 4,
+    "sac_automatic_entropy_tuning": true, // true
+    "sac_target_entropy": -10,
+    "sac_hidden_size": 256,
+    "sac_lr": 0.0003,
+    "mbrl_learned_rewards": false,
+    "mbrl_num_particles": 20,
+    "mbrl_planning_horizon": 20,
+    "mbrl_propagation_method": "random_model",
+
+    # Evaluation
+    "eval_freq": 10000,
+    "eval_episodes": 10,
+    "num_eval_episodes": 1, //  mbpo's internal evaluation loop 
+    # Saving and logging
+    "record": 0
+}
+
+
+// num_elites: 5
+// patience: 10
+// model_lr: 0.0003
+// model_wd: 5e-5
+// model_batch_size: 256
+// validation_ratio: 0.2
+// freq_train_model: 250
+// effective_model_rollouts_per_step: 400
+// rollout_schedule: [20, 300, 1, 25]
+// num_sac_updates_per_step: 20
+// sac_updates_every_steps: 1
+// num_epochs_to_retain_sac_buffer: 5
+
+// sac_gamma: 0.99
+// sac_tau: 0.005
+// sac_alpha: 0.2
+// sac_policy: "Gaussian"
+// sac_target_update_interval: 4
+// sac_automatic_entropy_tuning: false
+// sac_target_entropy: -1 # ignored, since entropy tuning is false
+// sac_hidden_size: 1024
+// sac_lr: 0.0001
+// sac_batch_size: 256

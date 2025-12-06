@@ -1,0 +1,91 @@
+{
+    #Environment
+    "env_name"  :"Gym-v0",
+    "workspace" :"table_nico",
+    "engine"    :"pybullet",
+    "render"    :"opengl",
+    "seed"      :1,
+    "camera"    :0,
+    "gui"       :0,
+    "visualize" :0,
+    "visgym"    :0,
+    #Robot;
+    "robot"         :"nico_grasp",
+    "robot_action"  :"joints_gripper",
+    "robot_init"    :[0.5, 0.2, 0.4],
+    "max_velocity"  :3,
+    "max_force"     :200,
+    "action_repeat" :1,
+    #Task
+    "task_type"             :"A",
+    "natural_language"      :0,
+    "task_objects"          :[{"init":{"obj_name":"null"},
+                            "goal":{"obj_name":"towertarget","fixed":1,"rand_rot":0, "sampling_area":[0.1,0.4,0.25,0.45,0.1,0.3]}}],
+    "color_dict"            : {"apple":["green"], "target":["gray"]},
+    "used_objects"          :{"num_range":[0,0], "obj_list":[]},
+    // Observation
+    // actual_state options (pick one): "endeff_xyz", "endeff_6D" (robot end effector), "obj_xyz", "obj_6D", "vae", "yolact", "voxel" or "dope"
+    // goal_state options (pick one): "obj_xyz", "obj_6D", "vae", "yolact", "voxel" or "dope"
+    // additional_obs options (pick none/one/more): "joints_xyz", "joints_angles", "endeff_xyz", "endeff_6D", "touch", "distractor"
+    "observation"           : {"actual_state":"obj_xyz", "goal_state":"obj_xyz", "additional_obs":["endeff_xyz"]},
+    #Distractor
+    "distractors"           : {"list":null, "moveable":1, "constant_speed":0, "movement_dims":3,
+                                       "movement_endpoints":[-0.3, 0.3, 0.4, 0.7, 0.1, 0.3]},
+    #Reward
+    "distance_type" :"euclidean",
+    "vae_path"      :null,
+    "yolact_path"   :null,
+    "yolact_config" :null,
+    #Train
+    "train_framework"   :"pytorch",
+    "algo"              :"pets",
+    "max_episode_steps" :512,
+    "steps"             :15000,
+    "pretrained_model"  :null,
+    "multiprocessing"   :null,
+    // PETS policy distillation
+    "pets_policy_mimic"     : false,
+    "pets_mimic_use_policy" : false,
+    "pets_mimic_epochs"     : 10,
+    "pets_mimic_batch_size" : 512,
+    "pets_mimic_hidden_sizes": [256, 256],
+    "pets_mimic_learning_rate": 0.001,
+    "pets_mimic_val_split"  : 0.1,
+    # MBRL (PETS)
+    "mbrl_planning_horizon" :15, // 20
+    "mbrl_num_particles"    :15,
+    "mbrl_init_random"      :4000,
+    "mbrl_train_freq"       :250,
+    "ensemble_size"         :5,
+    "mbrl_hid_size"         :64,
+    "mbrl_num_layers"       :3,
+    "mbrl_model_lr"         :0.001,
+    "mbrl_model_wd"         :0.0001,
+    "mbrl_batch_size"       :64, 
+    "mbrl_learned_rewards"  :false,
+    "mbrl_propagation_method":"fixed_model",
+    #CEM/MPPI (used by PETS)
+    "mbrl_optimizer"    :"icem",  // options: cem, icem, mppi
+    "cem_num_samples"   :100, // 100
+    "cem_num_elites"    :10, // 10
+    "cem_temperature"   :1.0,
+    "mppi_num_samples"  :100,
+    "mppi_num_iters"    :1,
+    "mppi_gamma"        :1.0,  
+    "mppi_sigma"        :1.0,
+    "mppi_beta"         :0.9,
+    "mppi_lambda"       :1.0,  // kept for backward compatibility; maps to gamma if mppi_gamma not set
+    "icem_num_iters"    :3, // 3
+    "icem_population_size":100, // 100
+    "icem_elite_ratio"  :0.1,
+    "icem_population_decay_factor":1.25,
+    "icem_colored_noise_exponent":2.0,
+    "icem_keep_elite_frac":0.1,
+    "icem_alpha"        :0.1,
+    "icem_return_mean_elites":true,
+    #Evaluation
+    "eval_freq"     :1000,
+    "eval_episodes" :5,
+    #Saving and logging
+    "record"    :0
+    }
