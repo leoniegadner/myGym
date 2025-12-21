@@ -295,17 +295,39 @@ class BayesianDynamicsModel(nn.Module):
         s_{t+1} ~ N(mu_theta(x), diag(exp(logvar_theta(x))))
     """
 
-    def __init__(self, latent_dim, action_dim, hidden_dim=128, deterministic=False):
+    def __init__(
+        self,
+        latent_dim,
+        action_dim,
+        hidden_dim=128,
+        deterministic=False,
+        predict_delta: bool = False,
+        logvar_min: float = -10.0,
+        logvar_max: float = 2.0,
+        device: str = "cpu",
+        normalize_inputs: bool = False,
+        normalize_double_precision: bool = False,
+    ):
         super().__init__()
         in_dim = latent_dim + action_dim
         out_dim = 2 * latent_dim
         self.deterministic = deterministic
+        self.predict_delta = bool(predict_delta)
+        self.logvar_min = float(logvar_min)
+        self.logvar_max = float(logvar_max)
+        self._device = torch.device(device)
 
         self.fc1 = BayesianLinear(in_dim, hidden_dim, deterministic=deterministic)
         self.fc2 = BayesianLinear(hidden_dim, hidden_dim, deterministic=deterministic)
         self.fc_out = BayesianLinear(hidden_dim, out_dim, deterministic=deterministic)
 
         self.latent_dim = latent_dim
+        self.input_normalizer = None
+        if normalize_inputs:
+            if MBRLNormalizer is None:
+                raise RuntimeError("mbrl.util.math.Normalizer is required for Bayesian dynamics normalization.")
+            dtype = torch.double if normalize_double_precision else torch.float
+            self.input_normalizer = MBRLNormalizer(in_dim, self._device, dtype=dtype)
 
     def sample_eps(self):
         """Sample and return per-layer eps to reuse across a rollout."""
@@ -314,6 +336,29 @@ class BayesianDynamicsModel(nn.Module):
             "fc2": self.fc2.sample_eps(),
             "fc_out": self.fc_out.sample_eps(),
         }
+
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_normalizer is None:
+            return x
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+            x_norm = self.input_normalizer.normalize(x).float()
+            return x_norm.squeeze(0)
+        return self.input_normalizer.normalize(x).float()
+
+    def update_normalizer(self, obs: np.ndarray, actions: np.ndarray) -> None:
+        if self.input_normalizer is None:
+            return
+        obs_arr = np.asarray(obs)
+        act_arr = np.asarray(actions)
+        if obs_arr.ndim == 1:
+            obs_arr = obs_arr.reshape(1, -1)
+        if act_arr.ndim == 1:
+            act_arr = act_arr.reshape(1, -1)
+        if obs_arr.shape[0] != act_arr.shape[0]:
+            raise ValueError("Bayesian normalizer expects matching batch sizes for obs and actions.")
+        model_in = np.concatenate([obs_arr, act_arr], axis=-1)
+        self.input_normalizer.update_stats(model_in)
 
     def forward(self, s, a, sample_theta=True, eps_cache=None):
         """
@@ -327,12 +372,15 @@ class BayesianDynamicsModel(nn.Module):
         
         eps_cache = eps_cache or {}
         x = torch.cat([s, a], dim=-1)
+        x = self._normalize_input(x)
         x = torch.tanh(self.fc1(x, sample=sample_theta, eps=eps_cache.get("fc1")))
         x = torch.tanh(self.fc2(x, sample=sample_theta, eps=eps_cache.get("fc2")))
         out = self.fc_out(x, sample=sample_theta, eps=eps_cache.get("fc_out"))
 
         mu, logvar = out[..., :self.latent_dim], out[..., self.latent_dim:]
-        logvar = logvar.clamp(min=-10.0, max=2.0)
+        if self.predict_delta:
+            mu = mu + s
+        logvar = logvar.clamp(min=self.logvar_min, max=self.logvar_max)
         return mu, logvar
 
     def kl_loss(self):
@@ -580,6 +628,7 @@ class LatentScalingAIFAgent(nn.Module):
         kl_theta_beta=1.0,
         policy_mode="cem",
         epistemic_scale: float = 0.0,
+        epistemic_mode: str = "logvar",
         preference_mean=None,
         preference_std=None,
         preference_mode: str = "gaussian",
@@ -610,6 +659,7 @@ class LatentScalingAIFAgent(nn.Module):
         model_wd: float = 0.0,
         logvar_reg_weight: float = 0.01,
         fully_observable_mdp: bool = False,
+        world_model_type: Optional[str] = None,
         dynamics_ensemble_size: int = 1,
         dynamics_num_layers: int = 3,
         dynamics_target_is_delta: bool = True,
@@ -631,31 +681,65 @@ class LatentScalingAIFAgent(nn.Module):
         self.action_low = torch.as_tensor(action_low, dtype=torch.float32, device=self.device)
         self.action_high = torch.as_tensor(action_high, dtype=torch.float32, device=self.device)
 
-        self.fully_observable_mdp = bool(fully_observable_mdp)
+        normalized_world_model = self._normalize_world_model_type(world_model_type)
+        if normalized_world_model is None:
+            normalized_world_model = "bayesian" if bool(fully_observable_mdp) else "vae"
+        if normalized_world_model not in ("vae", "bayesian", "pets"):
+            raise ValueError(
+                "world_model_type must be one of: 'vae', 'bayesian', or 'pets'. "
+                f"Got {world_model_type}."
+            )
+        self.world_model_type = normalized_world_model
+        self.fully_observable_mdp = normalized_world_model != "vae"
+        bayes_normalize_inputs = self.normalize_inputs and normalized_world_model == "bayesian"
         if self.fully_observable_mdp:
             self.latent_dim = obs_dim
             self.encoder = None
             self.decoder = None
-            self.dynamics = PETSDynamicsModel(
-                obs_dim=obs_dim,
-                action_dim=action_dim,
-                hidden_dim=hidden_dim,
-                num_layers=dynamics_num_layers,
-                ensemble_size=dynamics_ensemble_size,
-                predict_delta=dynamics_target_is_delta,
-                logvar_min=dynamics_logvar_min,
-                logvar_max=dynamics_logvar_max,
-                device=self.device,
-                normalize_inputs=self.normalize_inputs,
-                normalize_double_precision=normalize_double_precision,
-            ).to(self.device)
+            if normalized_world_model == "pets":
+                self.dynamics = PETSDynamicsModel(
+                    obs_dim=obs_dim,
+                    action_dim=action_dim,
+                    hidden_dim=hidden_dim,
+                    num_layers=dynamics_num_layers,
+                    ensemble_size=dynamics_ensemble_size,
+                    predict_delta=dynamics_target_is_delta,
+                    logvar_min=dynamics_logvar_min,
+                    logvar_max=dynamics_logvar_max,
+                    device=self.device,
+                    normalize_inputs=self.normalize_inputs,
+                    normalize_double_precision=normalize_double_precision,
+                ).to(self.device)
+            else:
+                self.dynamics = BayesianDynamicsModel(
+                    latent_dim=obs_dim,
+                    action_dim=action_dim,
+                    hidden_dim=hidden_dim,
+                    deterministic=False,
+                    predict_delta=dynamics_target_is_delta,
+                    logvar_min=dynamics_logvar_min,
+                    logvar_max=dynamics_logvar_max,
+                    device=self.device,
+                    normalize_inputs=bayes_normalize_inputs,
+                    normalize_double_precision=normalize_double_precision,
+                ).to(self.device)
         else:
             if latent_dim is None:
                 latent_dim = obs_dim
             self.latent_dim = latent_dim
             self.encoder = Encoder(obs_dim, latent_dim, hidden_dim).to(self.device)
             self.decoder = Decoder(latent_dim, obs_dim, hidden_dim).to(self.device)
-            self.dynamics = BayesianDynamicsModel(latent_dim, action_dim, hidden_dim, deterministic=deterministic).to(self.device)
+            self.dynamics = BayesianDynamicsModel(
+                latent_dim,
+                action_dim,
+                hidden_dim,
+                deterministic=False,
+                logvar_min=dynamics_logvar_min,
+                logvar_max=dynamics_logvar_max,
+                device=self.device,
+                normalize_inputs=False,
+                normalize_double_precision=normalize_double_precision,
+            ).to(self.device)
 
         self.policy_net = PolicyNet(self.latent_dim, action_dim, hidden_dim, deterministic=deterministic).to(self.device)
         self._world_model_modules = (
@@ -682,8 +766,10 @@ class LatentScalingAIFAgent(nn.Module):
         self.kl_theta_beta = kl_theta_beta
         self.policy_mode = policy_mode
         self.epistemic_scale = float(epistemic_scale)
+        self.epistemic_mode = self._normalize_epistemic_mode(epistemic_mode)
         self.log_efe_terms = bool(log_efe_terms)
         self.deterministic = bool(deterministic)
+        self._warned_epistemic_unavailable = False
         
         # Loss weights for world model training
         self.loss_weight_kl_state = float(loss_weight_kl_state)
@@ -787,6 +873,8 @@ class LatentScalingAIFAgent(nn.Module):
             logvar_pref = self.preference_logvar
         
         # Linear distance-based preference
+        # This was just for testing, to make it equivalernt to the 
+        # "normal" distance-based reward. 
         if self.preference_mode == "linear":
             # L2 distance scaled by preference_linear_scale
             distance = torch.norm(delta, p=2, dim=-1)
@@ -820,6 +908,73 @@ class LatentScalingAIFAgent(nn.Module):
         )
         return -logp_mix
 
+    @staticmethod
+    def _normalize_world_model_type(world_model_type: Optional[str]) -> Optional[str]:
+        if world_model_type is None:
+            return None
+        key = str(world_model_type).strip().lower()
+        aliases = {
+            "vae": "vae",
+            "latent": "vae",
+            "latent_vae": "vae",
+            "bayesian": "bayesian",
+            "bayes": "bayesian",
+            "fully_observable": "bayesian",
+            "fully_observable_bayesian": "bayesian",
+            "obs_bayesian": "bayesian",
+            "pets": "pets",
+            "pets_style": "pets",
+            "pets_ensemble": "pets",
+            "ensemble": "pets",
+        }
+        return aliases.get(key, key)
+
+    @staticmethod
+    def _normalize_epistemic_mode(mode: Optional[str]) -> str:
+        mode = str(mode or "logvar").lower()
+        if mode not in ("logvar", "ensemble_var", "both"):
+            raise ValueError(f"Unknown epistemic_mode '{mode}'. Expected logvar, ensemble_var, or both.")
+        return mode
+
+    def _use_ensemble_epistemic(self) -> bool:
+        if self.epistemic_scale <= 0.0:
+            return False
+        if self.epistemic_mode not in ("ensemble_var", "both"):
+            return False
+        if isinstance(self.dynamics, PETSDynamicsModel):
+            return int(getattr(self.dynamics, "ensemble_size", 1)) > 1
+        if isinstance(self.dynamics, BayesianDynamicsModel):
+            return max(1, int(self.mc_num_models or 1)) > 1
+        return False
+
+    @staticmethod
+    def _ensemble_epistemic_from_mu_stack(mu_stack: torch.Tensor) -> torch.Tensor:
+        return mu_stack.var(dim=0, unbiased=False).mean(dim=-1)
+
+    def _theta_mu_logvar_stack(self, s, a, num_models=None, theta_eps_list=None):
+        if isinstance(self.dynamics, PETSDynamicsModel):
+            mu_stack, logvar_stack = self.dynamics.forward_all_models(s, a)
+            return mu_stack, logvar_stack, None
+        if not isinstance(self.dynamics, BayesianDynamicsModel):
+            return None, None, None
+        if theta_eps_list is not None and len(theta_eps_list) > 0:
+            num_models = len(theta_eps_list)
+        else:
+            num_models = max(1, int(num_models or self.mc_num_models or 1))
+        if num_models <= 1:
+            return None, None, None
+        if theta_eps_list is None:
+            theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+        mu_list = []
+        logvar_list = []
+        for eps in theta_eps_list:
+            mu_k, logvar_k = self.dynamics(s, a, sample_theta=True, eps_cache=eps)
+            mu_list.append(mu_k)
+            logvar_list.append(logvar_k)
+        mu_stack = torch.stack(mu_list, dim=0)
+        logvar_stack = torch.stack(logvar_list, dim=0) if logvar_list else None
+        return mu_stack, logvar_stack, theta_eps_list
+
     # ------------------------------------------------------------------
     #  Training: free-energy-like loss for latent model
     # ------------------------------------------------------------------
@@ -847,7 +1002,10 @@ class LatentScalingAIFAgent(nn.Module):
         """
         Compute observation loss for a single ensemble member (or averaged model).
         """
-        mu_next, logvar_next = self.dynamics(o_prev, a_prev, sample_theta=True, eps_cache=model_idx)
+        eps_cache = model_idx
+        if isinstance(self.dynamics, BayesianDynamicsModel) and not isinstance(model_idx, dict):
+            eps_cache = None
+        mu_next, logvar_next = self.dynamics(o_prev, a_prev, sample_theta=True, eps_cache=eps_cache)
         diff = o_t - mu_next
         if self.use_mse_loss:
             return (diff.pow(2)).sum(dim=-1).mean()
@@ -872,43 +1030,67 @@ class LatentScalingAIFAgent(nn.Module):
         batch_size = o_t.shape[0]
 
         if self.fully_observable_mdp:
-            ensemble_size = getattr(self.dynamics, "ensemble_size", 1)
-            obs_loss_terms = []
-            if ensemble_size > 1:
-                for model_idx in range(ensemble_size):
-                    mu_next, logvar_next = self.dynamics(
-                        o_prev, a_prev, sample_theta=True, eps_cache=model_idx
-                    )
+            if isinstance(self.dynamics, PETSDynamicsModel):
+                ensemble_size = getattr(self.dynamics, "ensemble_size", 1)
+                obs_loss_terms = []
+                if ensemble_size > 1:
+                    for model_idx in range(ensemble_size):
+                        mu_next, logvar_next = self.dynamics(
+                            o_prev, a_prev, sample_theta=True, eps_cache=model_idx
+                        )
+                        diff = o_t - mu_next
+                        if self.use_mse_loss:
+                            # MSE: mean squared error
+                            obs_loss = (diff.pow(2)).sum(dim=-1).mean()
+                        else:
+                            # NLL: Gaussian negative log-likelihood
+                            var_next = torch.exp(logvar_next)
+                            obs_loss = 0.5 * (
+                                logvar_next + math.log(2 * math.pi) + diff.pow(2) / var_next
+                            ).sum(dim=-1).mean()
+                        obs_loss_terms.append(obs_loss)
+                    obs_loss_final = torch.stack(obs_loss_terms).mean()
+                else:
+                    mu_next, logvar_next = self.dynamics(o_prev, a_prev, sample_theta=True, eps_cache=None)
                     diff = o_t - mu_next
                     if self.use_mse_loss:
                         # MSE: mean squared error
-                        obs_loss = (diff.pow(2)).sum(dim=-1).mean()
+                        obs_loss_final = (diff.pow(2)).sum(dim=-1).mean()
                     else:
                         # NLL: Gaussian negative log-likelihood
                         var_next = torch.exp(logvar_next)
-                        obs_loss = 0.5 * (
+                        obs_loss_final = 0.5 * (
                             logvar_next + math.log(2 * math.pi) + diff.pow(2) / var_next
                         ).sum(dim=-1).mean()
-                    obs_loss_terms.append(obs_loss)
-                obs_loss_final = torch.stack(obs_loss_terms).mean()
+                kl_theta = (self.dynamics.kl_loss() / batch_size)
+                kl_state = torch.zeros((), device=self.device)
+                logvar_reg = torch.zeros((), device=self.device)
+                model = getattr(self.dynamics, "model", None)
+                if model is not None and hasattr(model, "max_logvar") and hasattr(model, "min_logvar"):
+                    logvar_reg = self.logvar_reg_weight * (model.max_logvar.sum() - model.min_logvar.sum())
+                F = (self.kl_theta_beta * kl_theta + self.loss_weight_nll_obs * obs_loss_final + logvar_reg)
+                obs_loss_key = "mse" if self.use_mse_loss else "nll_obs"
+                info = {
+                    "kl_state": kl_state.item() * self.loss_weight_kl_state,
+                    "kl_theta": kl_theta.item() * self.kl_theta_beta,
+                    obs_loss_key: obs_loss_final.item() * self.loss_weight_nll_obs,
+                    "logvar_reg": logvar_reg.item(),
+                    "F": F.item(),
+                }
+                return F, info
+
+            mu_next, logvar_next = self.dynamics(o_prev, a_prev, sample_theta=True, eps_cache=None)
+            diff = o_t - mu_next
+            if self.use_mse_loss:
+                obs_loss_final = (diff.pow(2)).sum(dim=-1).mean()
             else:
-                mu_next, logvar_next = self.dynamics(o_prev, a_prev, sample_theta=True, eps_cache=None)
-                diff = o_t - mu_next
-                if self.use_mse_loss:
-                    # MSE: mean squared error
-                    obs_loss_final = (diff.pow(2)).sum(dim=-1).mean()
-                else:
-                    # NLL: Gaussian negative log-likelihood
-                    var_next = torch.exp(logvar_next)
-                    obs_loss_final = 0.5 * (
-                        logvar_next + math.log(2 * math.pi) + diff.pow(2) / var_next
-                    ).sum(dim=-1).mean()
+                var_next = torch.exp(logvar_next)
+                obs_loss_final = 0.5 * (
+                    logvar_next + math.log(2 * math.pi) + diff.pow(2) / var_next
+                ).sum(dim=-1).mean()
             kl_theta = (self.dynamics.kl_loss() / batch_size)
             kl_state = torch.zeros((), device=self.device)
             logvar_reg = torch.zeros((), device=self.device)
-            model = getattr(self.dynamics, "model", None)
-            if model is not None and hasattr(model, "max_logvar") and hasattr(model, "min_logvar"):
-                logvar_reg = self.logvar_reg_weight * (model.max_logvar.sum() - model.min_logvar.sum())
             F = (self.kl_theta_beta * kl_theta + self.loss_weight_nll_obs * obs_loss_final + logvar_reg)
             obs_loss_key = "mse" if self.use_mse_loss else "nll_obs"
             info = {
@@ -993,7 +1175,7 @@ class LatentScalingAIFAgent(nn.Module):
         if num_epochs is None:
             num_epochs = self.model_train_epochs
 
-        if self.normalize_inputs and self.fully_observable_mdp and isinstance(self.dynamics, PETSDynamicsModel):
+        if self.normalize_inputs and self.fully_observable_mdp and hasattr(self.dynamics, "update_normalizer"):
             self._update_input_normalizer(replay_buffer)
 
         data = replay_buffer.get_all()
@@ -1169,7 +1351,10 @@ class LatentScalingAIFAgent(nn.Module):
             return
         if getattr(obs, "size", 0) == 0 or getattr(actions, "size", 0) == 0:
             return
-        self.dynamics.update_normalizer(obs, actions)
+        update_fn = getattr(self.dynamics, "update_normalizer", None)
+        if not callable(update_fn):
+            return
+        update_fn(obs, actions)
 
     def _expected_free_energy_step(
         self,
@@ -1177,6 +1362,7 @@ class LatentScalingAIFAgent(nn.Module):
         logvar_o: torch.Tensor,
         logvar_next: Optional[torch.Tensor] = None,
         return_terms: bool = False,
+        epistemic_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute a single-step expected free energy proxy.
@@ -1184,8 +1370,8 @@ class LatentScalingAIFAgent(nn.Module):
         Risk (extrinsic value) is the (masked) distance between the predicted
         observation and the preferred observation (goal), weighted by the
         preference variance. Epistemic value is approximated by predictive
-        uncertainty over next states (and observations), scaled by
-        self.epistemic_scale. EFE is risk - epistemic.
+        uncertainty over next states (and observations) and/or ensemble
+        disagreement, scaled by self.epistemic_scale. EFE is risk - epistemic.
         """
         # print("DEBUG Preference mean: ", self.preference_mean)
         # print("DEBUG mu_o: ", mu_o)
@@ -1195,10 +1381,25 @@ class LatentScalingAIFAgent(nn.Module):
         epistemic = torch.zeros_like(risk)
         if self.epistemic_scale > 0.0:
             epistemic_terms = []
-            if logvar_next is not None:
-                epistemic_terms.append(torch.exp(logvar_next).mean(dim=-1))
-            if logvar_o is not None:
-                epistemic_terms.append(torch.exp(logvar_o).mean(dim=-1))
+            use_logvar = self.epistemic_mode in ("logvar", "both")
+            use_ensemble = self.epistemic_mode in ("ensemble_var", "both")
+
+            def _add_logvar_terms():
+                if logvar_next is not None:
+                    epistemic_terms.append(torch.exp(logvar_next).mean(dim=-1))
+                if logvar_o is not None:
+                    epistemic_terms.append(torch.exp(logvar_o).mean(dim=-1))
+
+            if use_logvar:
+                _add_logvar_terms()
+            if use_ensemble:
+                if epistemic_override is not None:
+                    epistemic_terms.append(epistemic_override)
+                elif not use_logvar:
+                    if not self._warned_epistemic_unavailable:
+                        print("[AIF][warn] ensemble epistemic requested but unavailable; falling back to logvar.")
+                        self._warned_epistemic_unavailable = True
+                    _add_logvar_terms()
             if epistemic_terms:
                 epistemic = self.epistemic_scale * sum(epistemic_terms)
         efe = risk - epistemic
@@ -1240,6 +1441,14 @@ class LatentScalingAIFAgent(nn.Module):
         epistemic_terms = [] if self.log_efe_terms else None
         policy_eps = self.policy_net.sample_eps()
         dynamics_eps = self.dynamics.sample_eps()
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
+        num_models = max(1, int(self.mc_num_models or 1))
+        theta_eps_list = None
+        theta_model_idx = None
+        if use_bayes and use_ensemble_epistemic and num_models > 1:
+            theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+            theta_model_idx = random.randrange(num_models)
 
         for t in range(rollout_horizon):
             mean, std = self.policy_net(s, eps_cache=policy_eps)
@@ -1248,21 +1457,52 @@ class LatentScalingAIFAgent(nn.Module):
             )
             log_probs.append(log_prob)
             with torch.no_grad():
-                mu_next, logvar_next = self.dynamics(s, a, sample_theta=True, eps_cache=dynamics_eps)
-                std_next = torch.exp(0.5 * logvar_next)
-                s = mu_next + std_next * torch.randn_like(mu_next)
+                ensemble_epistemic = None
+                if use_ensemble_epistemic:
+                    mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
+                        s, a, num_models=num_models, theta_eps_list=theta_eps_list
+                    )
+                    if mu_stack is not None:
+                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        if use_bayes:
+                            idx = theta_model_idx if theta_model_idx is not None else 0
+                            mu_next = mu_stack[int(idx)]
+                            logvar_next = logvar_stack[int(idx)] if logvar_stack is not None else None
+                        else:
+                            model_idx = self.dynamics._select_model(eps_cache=dynamics_eps, sample_theta=True)
+                            if model_idx is None:
+                                mu_next = mu_stack.mean(dim=0)
+                                logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                            else:
+                                mu_next = mu_stack[int(model_idx)]
+                                logvar_next = logvar_stack[int(model_idx)] if logvar_stack is not None else None
+                    else:
+                        mu_next, logvar_next = self.dynamics(s, a, sample_theta=True, eps_cache=dynamics_eps)
+                else:
+                    mu_next, logvar_next = self.dynamics(s, a, sample_theta=True, eps_cache=dynamics_eps)
+                if logvar_next is None:
+                    s = mu_next
+                else:
+                    std_next = torch.exp(0.5 * logvar_next)
+                    s = mu_next + std_next * torch.randn_like(mu_next)
                 if self.fully_observable_mdp:
                     mu_o, logvar_o = mu_next, logvar_next
                 else:
                     mu_o, logvar_o = self.decoder(s)
             if self.log_efe_terms:
                 efe_t, risk_t, epistemic_t = self._expected_free_energy_step(
-                    mu_o, logvar_o, logvar_next, return_terms=True
+                    mu_o,
+                    logvar_o,
+                    logvar_next,
+                    return_terms=True,
+                    epistemic_override=ensemble_epistemic,
                 )
                 risk_terms.append(risk_t)
                 epistemic_terms.append(epistemic_t)
             else:
-                efe_t = self._expected_free_energy_step(mu_o, logvar_o, logvar_next)
+                efe_t = self._expected_free_energy_step(
+                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                )
             efes.append(efe_t)
 
         efes = torch.stack(efes, dim=1)  # [B, H]
@@ -1312,6 +1552,11 @@ class LatentScalingAIFAgent(nn.Module):
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         actions = torch.as_tensor(action_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         policy_eps = self.policy_net.sample_eps()
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
+        num_models = max(1, int(self.mc_num_models or 1))
+        theta_eps_list = None
+        theta_model_idx = None
         with torch.no_grad():
             if self.fully_observable_mdp:
                 s = obs
@@ -1331,19 +1576,53 @@ class LatentScalingAIFAgent(nn.Module):
         if efe is None:
             dynamics_eps = self.dynamics.sample_eps()
             with torch.no_grad():
-                mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
-                std_next = torch.exp(0.5 * logvar_next)
-                s_pred = mu_next + std_next * torch.randn_like(mu_next)
+                ensemble_epistemic = None
+                if use_ensemble_epistemic:
+                    if use_bayes and theta_eps_list is None and num_models > 1:
+                        theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+                        theta_model_idx = random.randrange(num_models)
+                    mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
+                        s, actions, num_models=num_models, theta_eps_list=theta_eps_list
+                    )
+                    if mu_stack is not None:
+                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        if use_bayes:
+                            idx = theta_model_idx if theta_model_idx is not None else 0
+                            mu_next = mu_stack[int(idx)]
+                            logvar_next = logvar_stack[int(idx)] if logvar_stack is not None else None
+                        else:
+                            model_idx = self.dynamics._select_model(eps_cache=dynamics_eps, sample_theta=True)
+                            if model_idx is None:
+                                mu_next = mu_stack.mean(dim=0)
+                                logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                            else:
+                                mu_next = mu_stack[int(model_idx)]
+                                logvar_next = logvar_stack[int(model_idx)] if logvar_stack is not None else None
+                    else:
+                        mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
+                else:
+                    mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
+                if logvar_next is None:
+                    s_pred = mu_next
+                else:
+                    std_next = torch.exp(0.5 * logvar_next)
+                    s_pred = mu_next + std_next * torch.randn_like(mu_next)
                 if self.fully_observable_mdp:
                     mu_o, logvar_o = mu_next, logvar_next
                 else:
                     mu_o, logvar_o = self.decoder(s_pred)
                 if self.log_efe_terms:
                     efe, risk, epistemic = self._expected_free_energy_step(
-                        mu_o, logvar_o, logvar_next, return_terms=True
+                        mu_o,
+                        logvar_o,
+                        logvar_next,
+                        return_terms=True,
+                        epistemic_override=ensemble_epistemic,
                     )
                 else:
-                    efe = self._expected_free_energy_step(mu_o, logvar_o, logvar_next)
+                    efe = self._expected_free_energy_step(
+                        mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                    )
 
         mean, std = self.policy_net(s, eps_cache=policy_eps)
         log_prob = self.policy_net.log_prob_action(
@@ -1390,6 +1669,11 @@ class LatentScalingAIFAgent(nn.Module):
 
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         actions = torch.as_tensor(action_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
+        num_models = max(1, int(self.mc_num_models or 1))
+        theta_eps_list = None
+        theta_model_idx = None
 
         with torch.no_grad():
             if self.fully_observable_mdp:
@@ -1398,19 +1682,53 @@ class LatentScalingAIFAgent(nn.Module):
                 mu, logvar = self.encoder(obs)
                 s = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
             dynamics_eps = self.dynamics.sample_eps()
-            mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
-            std_next = torch.exp(0.5 * logvar_next)
-            s_pred = mu_next + std_next * torch.randn_like(mu_next)
+            ensemble_epistemic = None
+            if use_ensemble_epistemic:
+                if use_bayes and theta_eps_list is None and num_models > 1:
+                    theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+                    theta_model_idx = random.randrange(num_models)
+                mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
+                    s, actions, num_models=num_models, theta_eps_list=theta_eps_list
+                )
+                if mu_stack is not None:
+                    ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                    if use_bayes:
+                        idx = theta_model_idx if theta_model_idx is not None else 0
+                        mu_next = mu_stack[int(idx)]
+                        logvar_next = logvar_stack[int(idx)] if logvar_stack is not None else None
+                    else:
+                        model_idx = self.dynamics._select_model(eps_cache=dynamics_eps, sample_theta=True)
+                        if model_idx is None:
+                            mu_next = mu_stack.mean(dim=0)
+                            logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                        else:
+                            mu_next = mu_stack[int(model_idx)]
+                            logvar_next = logvar_stack[int(model_idx)] if logvar_stack is not None else None
+                else:
+                    mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
+            else:
+                mu_next, logvar_next = self.dynamics(s, actions, sample_theta=True, eps_cache=dynamics_eps)
+            if logvar_next is None:
+                s_pred = mu_next
+            else:
+                std_next = torch.exp(0.5 * logvar_next)
+                s_pred = mu_next + std_next * torch.randn_like(mu_next)
             if self.fully_observable_mdp:
                 mu_o, logvar_o = mu_next, logvar_next
             else:
                 mu_o, logvar_o = self.decoder(s_pred)
             if self.log_efe_terms:
                 efe, risk, epistemic = self._expected_free_energy_step(
-                    mu_o, logvar_o, logvar_next, return_terms=True
+                    mu_o,
+                    logvar_o,
+                    logvar_next,
+                    return_terms=True,
+                    epistemic_override=ensemble_epistemic,
                 )
             else:
-                efe = self._expected_free_energy_step(mu_o, logvar_o, logvar_next)
+                efe = self._expected_free_energy_step(
+                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                )
 
         out = {
             "policy_real_efe": efe.mean().item(),
@@ -1573,7 +1891,17 @@ class LatentScalingAIFAgent(nn.Module):
             return mu_next, logvar_next
         return self.dynamics(s_flat, a_flat, sample_theta=not deterministic_plan, eps_cache=dyn_eps_cache)
 
-    def _evaluate_action_sequences(self, s0: torch.Tensor, action_seqs: torch.Tensor) -> torch.Tensor:
+    def _evaluate_action_sequences(
+        self,
+        s0: torch.Tensor,
+        action_seqs: torch.Tensor,
+        model_indices: Optional[torch.Tensor] = None,
+        *,
+        theta_eps_list: Optional[list] = None,
+        theta_eps_cache: Optional[dict] = None,
+        noise_cache: Optional[Any] = None,
+        model_indices_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if action_seqs.ndim == 2:
             action_seqs = action_seqs.unsqueeze(0)
         if action_seqs.ndim != 3:
@@ -1583,35 +1911,50 @@ class LatentScalingAIFAgent(nn.Module):
         s0 = s0.to(self.device)
         num_sequences = int(action_seqs.shape[0])
         horizon = int(action_seqs.shape[1])
+        if model_indices_cache is None:
+            model_indices_cache = model_indices
+        model_indices = model_indices_cache
 
-        num_models = max(1, int(self.mc_num_models or 1))
+        theta_list_len = len(theta_eps_list) if theta_eps_list is not None else 0
+        num_models = max(1, int(theta_list_len or self.mc_num_models or 1))
         num_traj = max(1, int(self.mc_num_trajectories or 1))
         num_particles = num_models * num_traj
-        deterministic_plan = bool(self.deterministic)
-        if deterministic_plan:
+        deterministic_rollout = bool(self.deterministic)
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
+        use_pets = isinstance(self.dynamics, PETSDynamicsModel)
+        if deterministic_rollout and not use_ensemble_epistemic:
             num_particles = 1
 
         s = s0.view(1, 1, -1).expand(num_particles, num_sequences, -1)
         actions = action_seqs.unsqueeze(0).expand(num_particles, -1, -1, -1)
 
-        model_indices = None
-        if (
-            self.fully_observable_mdp
-            and isinstance(self.dynamics, PETSDynamicsModel)
-            and not deterministic_plan
-        ):
-            ensemble_size = max(1, int(getattr(self.dynamics, "ensemble_size", 1)))
-            if ensemble_size > 1 and num_particles % ensemble_size == 0:
-                per_model = num_particles // ensemble_size
-                model_indices = torch.arange(ensemble_size, device=self.device).repeat_interleave(per_model)
-                model_indices = model_indices[torch.randperm(num_particles, device=self.device)]
-            else:
-                model_indices = torch.randint(0, ensemble_size, (num_particles,), device=self.device)
+        if model_indices is None and num_particles > 1:
+            if use_pets:
+                ensemble_size = max(1, int(getattr(self.dynamics, "ensemble_size", 1)))
+                if ensemble_size > 1 and num_particles % ensemble_size == 0:
+                    per_model = num_particles // ensemble_size
+                    model_indices = torch.arange(ensemble_size, device=self.device).repeat_interleave(per_model)
+                    model_indices = model_indices[torch.randperm(num_particles, device=self.device)]
+                else:
+                    model_indices = torch.randint(0, ensemble_size, (num_particles,), device=self.device)
+            elif use_bayes and num_models > 1:
+                if num_particles % num_models == 0:
+                    per_model = num_particles // num_models
+                    model_indices = torch.arange(num_models, device=self.device).repeat_interleave(per_model)
+                    model_indices = model_indices[torch.randperm(num_particles, device=self.device)]
+                else:
+                    model_indices = torch.randint(0, num_models, (num_particles,), device=self.device)
 
-        # For Bayesian dynamics, reuse one theta sample across particles to keep batching.
-        dyn_eps_cache = None
-        if not deterministic_plan and not self.fully_observable_mdp:
-            dyn_eps_cache = self.dynamics.sample_eps()
+        dyn_eps_cache = theta_eps_cache
+        theta_eps_list_local = theta_eps_list
+        if use_bayes and not deterministic_rollout:
+            if num_models > 1:
+                if theta_eps_list_local is None:
+                    theta_eps_list_local = [self.dynamics.sample_eps() for _ in range(num_models)]
+            else:
+                if dyn_eps_cache is None and theta_eps_list_local is None:
+                    dyn_eps_cache = self.dynamics.sample_eps()
 
         discounts = torch.pow(
             torch.as_tensor(self.gamma, device=self.device, dtype=torch.float32),
@@ -1619,31 +1962,113 @@ class LatentScalingAIFAgent(nn.Module):
         )
         total_efe = torch.zeros(num_particles, num_sequences, device=self.device)
 
+        def _get_transition_noise(timestep: int) -> Optional[torch.Tensor]:
+            if noise_cache is None:
+                return None
+            if isinstance(noise_cache, dict):
+                cached = noise_cache.get(num_sequences)
+                if cached is None or cached.shape[1] != num_particles:
+                    cached = torch.randn(
+                        horizon,
+                        num_particles,
+                        num_sequences,
+                        self.latent_dim,
+                        device=self.device,
+                        dtype=s0.dtype,
+                    )
+                    noise_cache[num_sequences] = cached
+                return cached[timestep]
+            if noise_cache.shape[0] <= timestep or noise_cache.shape[1] != num_particles:
+                return None
+            if noise_cache.shape[2] < num_sequences:
+                return None
+            return noise_cache[timestep, :, :num_sequences, :]
+
         with torch.no_grad():
             for t in range(horizon):
                 a_t = actions[:, :, t, :]
                 s_flat = s.reshape(num_particles * num_sequences, -1)
                 a_flat = a_t.reshape(num_particles * num_sequences, -1)
-                mu_next, logvar_next = self._dynamics_step_batched(
-                    s_flat,
-                    a_flat,
-                    num_sequences=num_sequences,
-                    model_indices=model_indices,
-                    deterministic_plan=deterministic_plan,
-                    dyn_eps_cache=dyn_eps_cache,
-                )
-                if deterministic_plan:
+                ensemble_epistemic = None
+                if use_bayes and num_models > 1:
+                    mu_stack = logvar_stack = None
+                    if theta_eps_list_local is not None:
+                        mu_stack, logvar_stack, theta_eps_list_local = self._theta_mu_logvar_stack(
+                            s_flat, a_flat, num_models=num_models, theta_eps_list=theta_eps_list_local
+                        )
+                    if mu_stack is not None and use_ensemble_epistemic:
+                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                    if mu_stack is not None:
+                        if model_indices is None:
+                            mu_next = mu_stack.mean(dim=0)
+                            logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                        else:
+                            idx_flat = model_indices.repeat_interleave(num_sequences)
+                            batch_idx = torch.arange(idx_flat.shape[0], device=self.device)
+                            mu_next = mu_stack[idx_flat, batch_idx]
+                            logvar_next = logvar_stack[idx_flat, batch_idx] if logvar_stack is not None else None
+                    else:
+                        mu_next, logvar_next = self._dynamics_step_batched(
+                            s_flat,
+                            a_flat,
+                            num_sequences=num_sequences,
+                            model_indices=model_indices,
+                            deterministic_plan=deterministic_rollout,
+                            dyn_eps_cache=dyn_eps_cache,
+                        )
+                elif use_ensemble_epistemic and use_pets:
+                    mu_stack, logvar_stack, _ = self._theta_mu_logvar_stack(s_flat, a_flat)
+                    if mu_stack is not None:
+                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        if deterministic_rollout:
+                            mu_next = mu_stack.mean(dim=0)
+                            logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                        else:
+                            if model_indices is None:
+                                mu_next = mu_stack.mean(dim=0)
+                                logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                            else:
+                                idx_flat = model_indices.repeat_interleave(num_sequences)
+                                batch_idx = torch.arange(idx_flat.shape[0], device=self.device)
+                                mu_next = mu_stack[idx_flat, batch_idx]
+                                logvar_next = logvar_stack[idx_flat, batch_idx] if logvar_stack is not None else None
+                    else:
+                        mu_next, logvar_next = self._dynamics_step_batched(
+                            s_flat,
+                            a_flat,
+                            num_sequences=num_sequences,
+                            model_indices=model_indices,
+                            deterministic_plan=deterministic_rollout,
+                            dyn_eps_cache=None,
+                        )
+                else:
+                    mu_next, logvar_next = self._dynamics_step_batched(
+                        s_flat,
+                        a_flat,
+                        num_sequences=num_sequences,
+                        model_indices=model_indices,
+                        deterministic_plan=deterministic_rollout,
+                        dyn_eps_cache=dyn_eps_cache,
+                    )
+                if deterministic_rollout or logvar_next is None:
                     s_flat = mu_next
                 else:
                     std_next = torch.exp(0.5 * logvar_next)
-                    s_flat = mu_next + std_next * torch.randn_like(mu_next)
+                    noise_t = _get_transition_noise(t)
+                    if noise_t is None:
+                        s_flat = mu_next + std_next * torch.randn_like(mu_next)
+                    else:
+                        noise_flat = noise_t.reshape(num_particles * num_sequences, -1)
+                        s_flat = mu_next + std_next * noise_flat
 
                 if self.fully_observable_mdp:
                     mu_o, logvar_o = mu_next, logvar_next
                 else:
                     mu_o, logvar_o = self.decoder(s_flat)
 
-                efe_t = self._expected_free_energy_step(mu_o, logvar_o, logvar_next)
+                efe_t = self._expected_free_energy_step(
+                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                )
                 total_efe += discounts[t] * efe_t.view(num_particles, num_sequences)
                 s = s_flat.view(num_particles, num_sequences, -1)
 
@@ -1769,6 +2194,59 @@ class LatentScalingAIFAgent(nn.Module):
             return self._plan_action_with_simple_cem(s0)
         all_scores_during_optimization = []  # Track scores from all iterations
         call_count = [0]  # Track how many times objective_fn is called
+        deterministic_plan = bool(self.deterministic)
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        num_models = max(1, int(self.mc_num_models or 1))
+        num_traj = max(1, int(self.mc_num_trajectories or 1))
+        num_particles = num_models * num_traj
+        if deterministic_plan and not use_ensemble_epistemic:
+            num_particles = 1
+        theta_eps_list = None
+        theta_eps_cache = None
+        cached_model_indices = None
+        if isinstance(self.dynamics, BayesianDynamicsModel) and not deterministic_plan:
+            if num_models > 1:
+                theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+            else:
+                theta_eps_cache = self.dynamics.sample_eps()
+        if cached_model_indices is None and not (deterministic_plan and not use_ensemble_epistemic):
+            if isinstance(self.dynamics, PETSDynamicsModel):
+                ensemble_size = max(1, int(getattr(self.dynamics, "ensemble_size", 1)))
+                if num_particles > 1:
+                    if ensemble_size > 1 and num_particles % ensemble_size == 0:
+                        per_model = num_particles // ensemble_size
+                        cached_model_indices = torch.arange(ensemble_size, device=self.device).repeat_interleave(per_model)
+                        cached_model_indices = cached_model_indices[
+                            torch.randperm(num_particles, device=self.device)
+                        ]
+                    else:
+                        cached_model_indices = torch.randint(
+                            0, ensemble_size, (num_particles,), device=self.device
+                        )
+            elif isinstance(self.dynamics, BayesianDynamicsModel) and num_models > 1 and num_particles > 1:
+                if num_particles % num_models == 0:
+                    per_model = num_particles // num_models
+                    cached_model_indices = torch.arange(num_models, device=self.device).repeat_interleave(per_model)
+                    cached_model_indices = cached_model_indices[
+                        torch.randperm(num_particles, device=self.device)
+                    ]
+                else:
+                    cached_model_indices = torch.randint(0, num_models, (num_particles,), device=self.device)
+
+        noise_cache = None
+        if not deterministic_plan:
+            population_size = int(getattr(optimizer, "population_size", self.cem_num_samples))
+            population_size = max(1, population_size)
+            noise_cache = {
+                population_size: torch.randn(
+                    horizon,
+                    num_particles,
+                    population_size,
+                    self.latent_dim,
+                    device=self.device,
+                    dtype=s0.dtype,
+                )
+            }
 
         def objective_fn(action_sequences):
             nonlocal all_scores_during_optimization
@@ -1776,7 +2254,14 @@ class LatentScalingAIFAgent(nn.Module):
             actions = torch.as_tensor(action_sequences, dtype=torch.float32, device=self.device)
             actions = self._reshape_action_sequences(actions, horizon, self.action_dim)
             actions = torch.clamp(actions, self.action_low, self.action_high)
-            efe_scores = self._evaluate_action_sequences(s0, actions)
+            efe_scores = self._evaluate_action_sequences(
+                s0,
+                actions,
+                model_indices_cache=cached_model_indices,
+                theta_eps_list=theta_eps_list,
+                theta_eps_cache=theta_eps_cache,
+                noise_cache=noise_cache,
+            )
 
             # Track all evaluated EFE scores from this population (lower is better).
             if isinstance(efe_scores, torch.Tensor):
@@ -1878,6 +2363,9 @@ class LatentScalingAIFAgent(nn.Module):
         last_scores_t: Optional[torch.Tensor] = None
         action_rollouts = max(1, int(self.policy_plan_action_rollouts))
         deterministic_plan = bool(self.deterministic)
+        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
+        num_models = max(1, int(self.mc_num_models or 1))
 
         for _ in range(self.policy_update_steps_per_plan):
             trajectories = []
@@ -1897,6 +2385,11 @@ class LatentScalingAIFAgent(nn.Module):
                     discount = torch.tensor(1.0, device=self.device)
                     traj_efe = torch.zeros(1, device=self.device)
                     dynamics_eps = None if deterministic_plan else self.dynamics.sample_eps()
+                    theta_eps_list = None
+                    theta_model_idx = None
+                    if use_bayes and use_ensemble_epistemic and num_models > 1:
+                        theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
+                        theta_model_idx = random.randrange(num_models)
 
                     for _ in range(horizon):
                         mean, std = self.policy_net(s_roll, eps_cache=policy_eps)
@@ -1908,13 +2401,45 @@ class LatentScalingAIFAgent(nn.Module):
                             actions.append(action.squeeze(0).detach())
 
                         with torch.no_grad():
-                            mu_next, logvar_next = self.dynamics(
-                                s_roll,
-                                action,
-                                sample_theta=not deterministic_plan,
-                                eps_cache=dynamics_eps,
-                            )
-                            if deterministic_plan:
+                            ensemble_epistemic = None
+                            if use_ensemble_epistemic:
+                                mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
+                                    s_roll, action, num_models=num_models, theta_eps_list=theta_eps_list
+                                )
+                                if mu_stack is not None:
+                                    ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                                    if deterministic_plan:
+                                        mu_next = mu_stack.mean(dim=0)
+                                        logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                                    elif use_bayes:
+                                        idx = theta_model_idx if theta_model_idx is not None else 0
+                                        mu_next = mu_stack[int(idx)]
+                                        logvar_next = logvar_stack[int(idx)] if logvar_stack is not None else None
+                                    else:
+                                        model_idx = self.dynamics._select_model(
+                                            eps_cache=dynamics_eps, sample_theta=True
+                                        )
+                                        if model_idx is None:
+                                            mu_next = mu_stack.mean(dim=0)
+                                            logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
+                                        else:
+                                            mu_next = mu_stack[int(model_idx)]
+                                            logvar_next = logvar_stack[int(model_idx)] if logvar_stack is not None else None
+                                else:
+                                    mu_next, logvar_next = self.dynamics(
+                                        s_roll,
+                                        action,
+                                        sample_theta=not deterministic_plan,
+                                        eps_cache=dynamics_eps,
+                                    )
+                            else:
+                                mu_next, logvar_next = self.dynamics(
+                                    s_roll,
+                                    action,
+                                    sample_theta=not deterministic_plan,
+                                    eps_cache=dynamics_eps,
+                                )
+                            if deterministic_plan or logvar_next is None:
                                 s_roll = mu_next
                             else:
                                 std_next = torch.exp(0.5 * logvar_next)
@@ -1923,7 +2448,9 @@ class LatentScalingAIFAgent(nn.Module):
                                 mu_o, logvar_o = mu_next, logvar_next
                             else:
                                 mu_o, logvar_o = self.decoder(s_roll)
-                            efe_t = self._expected_free_energy_step(mu_o, logvar_o, logvar_next)
+                            efe_t = self._expected_free_energy_step(
+                                mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                            )
                             traj_efe = traj_efe + discount * efe_t
                             discount = discount * self.gamma
 
@@ -2073,6 +2600,7 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_replay_size", 100000)
         self.arg_dict.setdefault("aif_gamma", 0.99)
         self.arg_dict.setdefault("aif_epistemic_scale", 0.0)
+        self.arg_dict.setdefault("aif_epistemic_mode", "logvar")
         self.arg_dict.setdefault("aif_pref_mean", None)
         self.arg_dict.setdefault("aif_pref_std", None)
         self.arg_dict.setdefault("aif_pref_target_weight", 0.0)
@@ -2165,7 +2693,16 @@ class ActiveInferenceSB3:
             self._drop_goal_from_state = False
         self._state_layout: Optional[Dict[str, Any]] = self._compute_state_layout()
 
-        world_model_cfg = self.arg_dict.get("aif_world_model", {}) or {}
+        raw_world_model = self.arg_dict.get("aif_world_model", {}) or {}
+        world_model_cfg = raw_world_model if isinstance(raw_world_model, dict) else {}
+        world_model_type = None
+        if isinstance(raw_world_model, str):
+            world_model_type = raw_world_model
+        elif isinstance(raw_world_model, dict):
+            world_model_type = raw_world_model.get("type") or raw_world_model.get("model") or raw_world_model.get("name")
+        if "aif_world_model_type" in self.arg_dict:
+            world_model_type = self.arg_dict.get("aif_world_model_type")
+        world_model_type = LatentScalingAIFAgent._normalize_world_model_type(world_model_type)
         hidden_dim = world_model_cfg.get("hid_size", 128)
         ensemble_size = world_model_cfg.get("ensemble_size", 5)
         dynamics_num_layers = int(world_model_cfg.get("num_layers", 3))
@@ -2185,7 +2722,13 @@ class ActiveInferenceSB3:
             if goal_len > 0 and obs_dim >= goal_len:
                 obs_dim -= goal_len
         action_dim = int(np.prod(self.action_space.shape))
-        fully_observable_mdp = bool(self.arg_dict.get("fully_observable_mdp", False))
+        if world_model_type is None:
+            fully_observable_mdp = bool(self.arg_dict.get("fully_observable_mdp", False))
+            world_model_type = "bayesian" if fully_observable_mdp else "vae"
+        else:
+            fully_observable_mdp = world_model_type != "vae"
+        self.arg_dict["fully_observable_mdp"] = fully_observable_mdp
+        self.arg_dict["aif_world_model_type"] = world_model_type
         latent_dim = obs_dim if fully_observable_mdp else self.arg_dict.get("aif_latent_dim")
 
         self.agent = LatentScalingAIFAgent(
@@ -2206,6 +2749,7 @@ class ActiveInferenceSB3:
             kl_theta_beta=self.arg_dict.get("aif_kl_theta_beta", 1.0),
             policy_mode=str(self.arg_dict.get("aif_policy_mode", "cem")).lower(),
             epistemic_scale=self.arg_dict.get("aif_epistemic_scale", 0.0),
+            epistemic_mode=self.arg_dict.get("aif_epistemic_mode", "logvar"),
             preference_mean=self.arg_dict.get("aif_pref_mean"),
             preference_std=self.arg_dict.get("aif_pref_std"),
             preference_mode=self.arg_dict.get("aif_preference_mode", "gaussian"),
@@ -2236,6 +2780,7 @@ class ActiveInferenceSB3:
             model_wd=self.arg_dict.get("aif_model_wd", 0.0),
             logvar_reg_weight=self.arg_dict.get("aif_logvar_reg_weight", 0.01),
             fully_observable_mdp=fully_observable_mdp,
+            world_model_type=world_model_type,
             dynamics_ensemble_size=ensemble_size,
             dynamics_num_layers=dynamics_num_layers,
             dynamics_target_is_delta=dynamics_target_is_delta,
@@ -2670,6 +3215,17 @@ class ActiveInferenceSB3:
                         self._model_update_debug_printed = True
                     if last_info and self.arg_dict.get("aif_log_vfe_terms", False):
                         log_info.update(last_info)
+                        vfe_parts = []
+                        for key in ("F", "kl_state", "kl_theta", "nll_obs", "mse", "logvar_reg"):
+                            if key in last_info and last_info[key] is not None:
+                                vfe_parts.append(f"{key}={float(last_info[key]):.4f}")
+                        for key in sorted(k for k in last_info.keys() if k.startswith("val_")):
+                            val = last_info.get(key)
+                            if val is None:
+                                continue
+                            vfe_parts.append(f"{key}={float(val):.4f}")
+                        if vfe_parts:
+                            print(f"[AIF] step {self.num_timesteps} vfe: " + ", ".join(vfe_parts))
                     self._latest_update_info = last_info
 
             if is_random_step:
