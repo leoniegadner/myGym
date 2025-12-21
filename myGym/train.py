@@ -9,7 +9,7 @@ import json
 import os
 import random
 import time
-from typing import Callable
+from typing import Any, Callable, Dict, Optional
 
 
 import numpy as np
@@ -20,6 +20,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import json, commentjson
 import gymnasium as gym
+from myGym.active_inference import ActiveInferenceSB3, MetaAIFSB3, MetaAIFActionWrapper
 from sklearn.model_selection import ParameterGrid
 from myGym.envs.gym_env import GymEnv
 
@@ -136,8 +137,18 @@ def make_env(arg_dict: dict, rank: int, seed: int = 0, model_logdir=None) -> Cal
 
 
 def configure_implemented_combos(env, model_logdir, arg_dict):
-    implemented_combos = {"ppo": {}, "sac": {}, "td3": {}, "a2c": {}, "multippo": {}, 
-                          "pets": {}, "mbpo": {}, "planet": {}} # mbrl
+    implemented_combos = {
+        "ppo": {},
+        "sac": {},
+        "td3": {},
+        "a2c": {},
+        "multippo": {},
+        "pets": {},
+        "mbpo": {},
+        "planet": {},
+        "aif": {},
+        "meta_aif": {},
+    }  # mbrl + active inference
 
     # populate action bounds for MBRL agents if available
     # TODO: move this somewhere less hacky.
@@ -185,6 +196,9 @@ def configure_implemented_combos(env, model_logdir, arg_dict):
     implemented_combos["multippo"]["pytorch"] = [MultiPPOSB3, ("MlpPolicy", env),
                                                  {"n_steps": arg_dict["algo_steps"], "verbose": 1, "tensorboard_log": model_logdir,
                                                   "device": "cpu", "n_models": arg_dict["num_networks"]}]
+    implemented_combos["aif"]["pytorch"] = [ActiveInferenceSB3, (env,), {"arg_dict": arg_dict}]
+    meta_env = env if isinstance(env, MetaAIFActionWrapper) else MetaAIFActionWrapper(env)
+    implemented_combos["meta_aif"]["pytorch"] = [MetaAIFSB3, (meta_env,), {"arg_dict": arg_dict}]
     return implemented_combos
 
 def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None):
@@ -216,12 +230,14 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
     if pretrained_model:
         if not os.path.isabs(pretrained_model):
             pretrained_model = os.path.join(pkg_resources.files("myGym"), pretrained_model)
-        env = model_args[1]
-        if not arg_dict["multiprocessing"]:
-            vec_env = DummyVecEnv([lambda: env])
+        env_for_load = model_args[0] if isinstance(model_args, tuple) and len(model_args) == 1 else model_args[1]
+        if arg_dict["algo"] in ["aif", "meta_aif"]:
+            vec_env = env_for_load
+        elif not arg_dict["multiprocessing"]:
+            vec_env = DummyVecEnv([lambda: env_for_load])
         else:
-            vec_env = env
-        
+            vec_env = env_for_load
+
         model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(
                 pretrained_model, vec_env, device="cpu", **model_kwargs)
     else:
@@ -241,6 +257,9 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
 
     start_time = time.time()
     callbacks_list = []
+    if arg_dict["algo"] in ["sac", "td3", "ppo", "a2c", "multippo"]:
+        action_log_freq = arg_dict.get("action_log_freq", 1000)
+        callbacks_list.append(ActionLoggerCallback(log_every=action_log_freq))
     auto_save_callback = SaveOnBestTrainingRewardCallback(check_freq=1024, logdir=model_logdir, env=env,
                                                               engine=arg_dict["engine"],
                                                               multiprocessing=arg_dict["multiprocessing"],
@@ -262,7 +281,7 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
                                                camera_id=arg_dict["camera"], num_cpu=NUM_CPU, starting_steps = steps)
     
         
-        elif arg_dict["algo"] in ["pets", "mbpo", "planet"]:
+        elif arg_dict["algo"] in ["pets", "mbpo", "planet", "aif", "meta_aif"]:
             eval_callback = MBRLEvalCallback(
                 eval_env, log_path=model_logdir,
                 eval_freq=arg_dict["eval_freq"],
@@ -504,6 +523,42 @@ def get_parser():
     parser.add_argument("-s", "--steps", type=int, help="The number of steps to train")
     parser.add_argument("-ms", "--max_episode_steps", type=int,  help="The maximum number of steps per episode")
     parser.add_argument("-ma", "--algo_steps", type=int,  help="The number of steps per for algo training (PPO2,A2C)")
+    # Active inference
+    parser.add_argument("--aif_initial_random_steps", type=int, help="Initial random exploration steps for AIF agent")
+    parser.add_argument("--aif_model_update_freq", type=int, help="World model update frequency (in steps) for AIF")
+    parser.add_argument("--aif_policy_updates_per_step", type=int, help="How many policy updates per env step in AIF")
+    parser.add_argument("--aif_epistemic_scale", type=float, help="Scale of epistemic term in AIF expected free energy")
+    parser.add_argument("--aif_replay_size", type=int, help="Replay buffer size for AIF agent")
+    parser.add_argument("--aif_gamma", type=float, help="Discount factor used by the AIF policy")
+    parser.add_argument("--aif_device", type=str, help="Device for AIF training (cpu/cuda)")
+    parser.add_argument("--aif_log_freq", type=int, help="Logging frequency (steps) for AIF training metrics")
+    parser.add_argument("--aif_model_normalize", type=int, help="Enable PETS-style input normalization for AIF (1/0)")
+    # Meta-AIF (belief-based, uncertainty-adaptive planning) hyperparameters
+    parser.add_argument("--meta_aif_H_min", type=int, help="Min planning horizon for meta AIF")
+    parser.add_argument("--meta_aif_H_max", type=int, help="Max planning horizon for meta AIF")
+    parser.add_argument("--meta_aif_H_internal", type=int, help="Fixed planning horizon override for meta AIF")
+    parser.add_argument("--meta_aif_K_min", type=int, help="Min number of candidate policies for meta AIF")
+    parser.add_argument("--meta_aif_K_max", type=int, help="Max number of candidate policies for meta AIF")
+    parser.add_argument("--meta_aif_K_internal", type=int, help="Number of candidate policies for meta AIF (training/internal)")
+    parser.add_argument("--meta_aif_K_external", type=int, help="Number of candidate policies for meta AIF (evaluation/external)")
+    parser.add_argument("--meta_aif_meta_candidates", type=int, help="How many (horizon, candidate) meta-options to score each step")
+    parser.add_argument("--meta_aif_think_cost", type=float, help="Cost multiplier for thinking steps (horizon*candidates)")
+    parser.add_argument("--meta_aif_efe_scale", type=float, help="Scaling factor applied to EFE predictor outputs")
+    parser.add_argument("--meta_aif_efe_clip", type=float, help="Max clamp value for scaled EFE predictor outputs")
+    parser.add_argument("--meta_aif_K", type=int, help="Legacy: unified candidate count for meta AIF")
+    parser.add_argument("--meta_aif_lambda_think", type=float, help="Per-step cost for internal actions")
+    parser.add_argument("--meta_aif_lambda_depth", type=float, help="Cost per unit planning depth")
+    parser.add_argument("--meta_aif_lambda_cand", type=float, help="Cost per candidate policy")
+    parser.add_argument("--meta_aif_beta_state", type=float, help="Weight for state epistemic term")
+    parser.add_argument("--meta_aif_beta_param", type=float, help="Weight for parameter epistemic term")
+    parser.add_argument("--meta_aif_alpha_obs", type=float, help="Weight for observation free energy")
+    parser.add_argument("--meta_aif_gamma", type=float, help="Softmax temperature over policies")
+    parser.add_argument("--meta_aif_param_dim", type=int, help="Latent parameter dimension for meta AIF")
+    parser.add_argument("--meta_aif_hidden_size", type=int, help="Hidden layer width for meta AIF nets")
+    parser.add_argument("--meta_aif_lr", type=float, help="Learning rate for meta AIF optimizer")
+    parser.add_argument("--meta_aif_internal_threshold", type=float, help="Magnitude threshold to mark actions as internal (planning) vs external")
+    parser.add_argument("--meta_aif_debug", action="store_true", help="Enable debug logs for meta AIF")
+    parser.add_argument("--meta_aif_log_thinking", type=int, help="Enable per-step meta-planning logs (1/0)")
     # MBRL common
     parser.add_argument("-mbph", "--mbrl_planning_horizon", type=int, help="mbrl planning horizon")
     parser.add_argument("-mbnp", "--mbrl_num_particles", type=int, help="particles for model rollout")
@@ -692,13 +747,21 @@ def main():
         #In case of renewing training from a checkpoint, logdir with monitor.csv
         #and train.json are located in the directory where pretrained model is stored
         model_logdir = os.path.dirname(os.path.dirname(arg_dict["pretrained_model"]))
-    if arg_dict["multiprocessing"]:
+    if arg_dict["algo"] in ["aif", "meta_aif"]:
+        if arg_dict["multiprocessing"]:
+            print("AIF does not support multiprocessing; running single environment instead.")
+            arg_dict["multiprocessing"] = None
+        env = configure_env(arg_dict, model_logdir, for_train=1)
+        if arg_dict["algo"] == "meta_aif":
+            env = MetaAIFActionWrapper(env)
+    elif arg_dict["multiprocessing"]:
         NUM_CPU = max(int(arg_dict["multiprocessing"]), 1)
         env = SubprocVecEnv([make_env(arg_dict, i, model_logdir=model_logdir) for i in range(NUM_CPU)])
         env = VecMonitor(env, model_logdir)
     else:
         env = configure_env(arg_dict, model_logdir, for_train=1)
 
+    log_action_and_joint_info(env)
     implemented_combos = configure_implemented_combos(env, model_logdir, arg_dict)
     train(env, implemented_combos, model_logdir, arg_dict, arg_dict["pretrained_model"])
 

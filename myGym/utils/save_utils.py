@@ -1,6 +1,6 @@
 """Small helpers for save/load path handling."""
 
-SB3_STYLE_ALGOS = {"ppo", "multippo", "mppo", "pets", "mbpo", "planet"}
+SB3_STYLE_ALGOS = {"ppo", "multippo", "mppo", "pets", "mbpo", "planet", "aif", "meta_aif"}
 
 
 def uses_sb3_style(algo: str) -> bool:

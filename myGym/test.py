@@ -468,6 +468,8 @@ def test_model(
                     load_kwargs[key] = combo_kwargs[key]
             if "device" in arg_dict:
                 load_kwargs["device"] = arg_dict["device"]
+        if arg_dict["algo"] in ["aif", "meta_aif"] and "aif_device" in arg_dict:
+            load_kwargs["device"] = arg_dict["aif_device"]
 
         #TODO: maybe this if else is unnecessary?
         if "multi" in arg_dict["algo"]:
@@ -475,7 +477,16 @@ def test_model(
             model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(arg_dict["pretrained_model"], env = env)
             model.env = model_args[1].env
         else:
-            model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(arg_dict["pretrained_model"], env=env, **load_kwargs)
+            model_args = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][1]
+            env_for_load = env
+            if isinstance(model_args, tuple):
+                if len(model_args) == 1:
+                    env_for_load = model_args[0]
+                elif len(model_args) > 1:
+                    env_for_load = model_args[1]
+            model = implemented_combos[arg_dict["algo"]][arg_dict["train_framework"]][0].load(
+                arg_dict["pretrained_model"], env=env_for_load, **load_kwargs
+            )
     except:
         if (arg_dict["algo"] in implemented_combos.keys()) and (
                 arg_dict["train_framework"] not in list(implemented_combos[arg_dict["algo"]].keys())):

@@ -39,6 +39,10 @@ try:
     from tqdm import tqdm
 except Exception:
     tqdm = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 try:
     import mbrl.planning as mbrl_planning
@@ -1769,6 +1773,21 @@ class LatentScalingAIFAgent(nn.Module):
                 s = mu + torch.exp(0.5 * logvar) * eps  # [1, latent_dim]
             return s.squeeze(0)  # [latent_dim]
 
+    def policy_net_mean_action(self, obs_np: np.ndarray) -> torch.Tensor:
+        """
+        Return the deterministic policy action from the policy_net mean.
+        """
+        with torch.no_grad():
+            o = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+            if self.fully_observable_mdp:
+                s = o
+            else:
+                mu, _ = self.encoder(o)
+                s = mu
+            mean, _ = self.policy_net(s, sample=False)
+            action, _, _ = self.policy_net._squash(mean, self.action_low, self.action_high)
+            return action.squeeze(0)
+
     def plan_action(self, obs_np):
         """
         Plan an action from current observation using CEM in latent space.
@@ -2613,6 +2632,7 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_mc_models", None)
         self.arg_dict.setdefault("aif_kl_theta_beta", 1.0)
         self.arg_dict.setdefault("aif_policy_mode", "cem")  # options: "cem", "icem", "policy_net", "simple_cem"
+        self.arg_dict.setdefault("aif_policy_eval_mode", "plan")  # options: "plan", "mean" (policy_net only)
         self.arg_dict.setdefault("aif_policy_imagination_freq", 0)  # 0 disables
         self.arg_dict.setdefault("aif_policy_imagination_horizon", None)
         self.arg_dict.setdefault("aif_policy_imagination_updates", 1)
@@ -2638,6 +2658,7 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_policy_posterior_mc_samples", 4)
         self.arg_dict.setdefault("aif_policy_efe_baseline_momentum", 0.9)
         self.arg_dict.setdefault("aif_policy_plan_action_rollouts", 1)
+        self.arg_dict.setdefault("aif_tensorboard_log", True)
         self.arg_dict.setdefault("aif_loss_weight_kl_state", 1.0)
         self.arg_dict.setdefault("aif_loss_weight_nll_obs", 1.0)
         self.arg_dict.setdefault("aif_use_mse_loss", False)
@@ -2809,6 +2830,18 @@ class ActiveInferenceSB3:
             or getattr(self.env, "_max_episode_steps", 0)
             or 0
         )
+        self._policy_eval_mode = self._normalize_policy_eval_mode(
+            self.arg_dict.get("aif_policy_eval_mode", "plan")
+        )
+        self.arg_dict["aif_policy_eval_mode"] = self._policy_eval_mode
+        self._tb_writer = None
+        self._tb_log_dir = None
+        if bool(self.arg_dict.get("aif_tensorboard_log", False)) and SummaryWriter is not None:
+            base_logdir = self.arg_dict.get("aif_tensorboard_dir") or self.arg_dict.get("logdir")
+            if base_logdir:
+                self._tb_log_dir = os.path.join(base_logdir, "aif_tb")
+                os.makedirs(self._tb_log_dir, exist_ok=True)
+                self._tb_writer = SummaryWriter(log_dir=self._tb_log_dir)
 
     @staticmethod
     def _infer_obs_dim(space: gym.Space) -> int:
@@ -2817,6 +2850,13 @@ class ActiveInferenceSB3:
                 return int(np.prod(space.spaces["observation"].shape))
             return int(sum(np.prod(s.shape) for s in space.spaces.values()))
         return int(np.prod(space.shape))
+
+    @staticmethod
+    def _normalize_policy_eval_mode(mode: Optional[str]) -> str:
+        mode = str(mode or "plan").lower()
+        if mode not in ("plan", "mean"):
+            raise ValueError(f"Unknown aif_policy_eval_mode '{mode}'. Expected 'plan' or 'mean'.")
+        return mode
 
     def _compute_obs_layout(self) -> Optional[Dict[str, Any]]:
         """
@@ -3107,6 +3147,43 @@ class ActiveInferenceSB3:
             self._episode_pbar.close()
             self._episode_pbar = None
 
+    def _log_tb_metrics(self, metrics: Dict[str, Any], step: int) -> None:
+        if self._tb_writer is None:
+            return
+        for key, val in metrics.items():
+            if val is None:
+                continue
+            if isinstance(val, torch.Tensor):
+                if val.numel() == 1:
+                    self._tb_writer.add_scalar(key, float(val.item()), step)
+                else:
+                    self._tb_writer.add_histogram(key, val.detach().cpu().numpy(), step)
+                continue
+            if isinstance(val, (int, float, np.number)):
+                self._tb_writer.add_scalar(key, float(val), step)
+                continue
+            if isinstance(val, (list, tuple, np.ndarray)):
+                arr = np.asarray(val)
+                if arr.size == 1:
+                    self._tb_writer.add_scalar(key, float(arr.reshape(-1)[0]), step)
+                else:
+                    self._tb_writer.add_histogram(key, arr, step)
+                continue
+        try:
+            self._tb_writer.flush()
+        except Exception:
+            pass
+
+    def _close_tb_writer(self) -> None:
+        if self._tb_writer is None:
+            return
+        try:
+            self._tb_writer.flush()
+            self._tb_writer.close()
+        except Exception:
+            pass
+        self._tb_writer = None
+
     def _setup_callback(self, callback):
         if callback is None:
             return None
@@ -3288,8 +3365,29 @@ class ActiveInferenceSB3:
                 if real_info and self.arg_dict.get("aif_log_efe_terms", False):
                     log_info.update(real_info)
 
-            if log_info and self.log_freq and self.num_timesteps % self.log_freq == 0:
-                print(f"[AIF] step {self.num_timesteps}: {log_info}")
+            if self.log_freq and self.num_timesteps % self.log_freq == 0:
+                if not is_random_step:
+                    plan_score = getattr(self.agent, "_cached_policy_score", None)
+                    if plan_score is not None:
+                        log_info["policy_plan_efe"] = float(plan_score)
+                    action_logprob = getattr(self.agent, "_last_action_logprob", None)
+                    if action_logprob is not None:
+                        log_info["policy_action_logprob"] = float(action_logprob.detach().cpu().item())
+                    with torch.no_grad():
+                        state_t = torch.as_tensor(flat_obs, dtype=torch.float32, device=self.agent.device).unsqueeze(0)
+                        if not self.agent.fully_observable_mdp:
+                            mu, _ = self.agent.encoder(state_t)
+                            state_t = mu
+                        mean, std = self.agent.policy_net(state_t, sample=False)
+                        log_info["policy_mean"] = mean.squeeze(0).detach().cpu().numpy().tolist()
+                        log_info["policy_std"] = std.squeeze(0).detach().cpu().numpy().tolist()
+                        entropy = (0.5 * (1.0 + math.log(2 * math.pi)) + torch.log(std)).sum(dim=-1)
+                        log_info["policy_entropy"] = float(entropy.item())
+                if log_info:
+                    tb_metrics = {f"aif/{k}": v for k, v in log_info.items()}
+                    self._log_tb_metrics(tb_metrics, self.num_timesteps)
+                if log_info:
+                    print(f"[AIF] step {self.num_timesteps}: {log_info}")
 
             if callback is not None:
                 callback.num_timesteps = self.num_timesteps
@@ -3344,15 +3442,22 @@ class ActiveInferenceSB3:
 
         if callback is not None and hasattr(callback, "on_training_end"):
             callback.on_training_end()
+        self._close_tb_writer()
         self._close_episode_pbar()
         return self
 
     def predict(self, observation, deterministic: bool = False):
-        # Planning already averages over theta samples; deterministic flag is kept for API parity.
         obs_vec, pref_vec, pref_mask = self._flatten_obs_with_pref(observation)
         if pref_vec is not None:
             self.agent.set_preference_mean(pref_vec, pref_mask)
-        action = self.agent.act(obs_vec)
+        eval_mode = self._policy_eval_mode
+        if deterministic:
+            eval_mode = "mean"
+        policy_mode = str(self.arg_dict.get("aif_policy_mode", "cem")).lower()
+        if eval_mode == "mean" and policy_mode == "policy_net":
+            action = self.agent.policy_net_mean_action(obs_vec)
+        else:
+            action = self.agent.act(obs_vec)
         action = np.asarray(action, dtype=np.float32)
         if action.ndim > 1:
             action = action.squeeze()
@@ -3381,6 +3486,7 @@ class ActiveInferenceSB3:
             {
                 "agent_state": self.agent.state_dict(),
                 "optimizer_state": self.agent.optimizer.state_dict(),
+                "policy_optimizer_state": self.agent.policy_optimizer.state_dict(),
                 "num_timesteps": self.num_timesteps,
                 "arg_dict": self.arg_dict,
             },
@@ -3460,6 +3566,9 @@ class ActiveInferenceSB3:
         optim_state = state.get("optimizer_state")
         if optim_state:
             instance.agent.optimizer.load_state_dict(optim_state)
+        policy_optim_state = state.get("policy_optimizer_state")
+        if policy_optim_state:
+            instance.agent.policy_optimizer.load_state_dict(policy_optim_state)
         instance.num_timesteps = int(state.get("num_timesteps", 0))
         return instance
 

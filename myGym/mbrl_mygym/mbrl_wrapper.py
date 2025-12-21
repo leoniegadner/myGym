@@ -584,7 +584,7 @@ class MBRLWrapper:
                 if callback is not None:
                     callback(*cb_args)
 
-            return orig_train_model_and_save(
+            result = orig_train_model_and_save(
                 model,
                 model_trainer,
                 cfg,
@@ -592,6 +592,20 @@ class MBRLWrapper:
                 work_dir=work_dir,
                 callback=chained_cb,
             )
+            if self.algo_name == "pets":
+                train_loss = self.model_train_metrics.get("train_loss")
+                train_iter = self.model_train_metrics.get("train_iteration")
+                if train_loss is None:
+                    loss_str = "n/a"
+                elif isinstance(train_loss, (float, int)):
+                    loss_str = f"{train_loss:.6f}"
+                else:
+                    loss_str = str(train_loss)
+                if train_iter is not None:
+                    print(f"[MBRL][PETS] dynamics train loss: {loss_str} (iter {train_iter})")
+                else:
+                    print(f"[MBRL][PETS] dynamics train loss: {loss_str}")
+            return result
 
         mbrl_util.common.create_replay_buffer = capture_rb
         mbrl_util.common.create_one_dim_tr_model = capture_model

@@ -46,7 +46,7 @@
     // ---------------- Distractors ----------------
     "distractors" : {
         "list": null,                   // Optional distractor list
-        "moveable": 1,                  // 1 if distractors move
+        "moveable": 0,                  // 1 if distractors move
         "constant_speed": 0,            // 1 for constant-speed motion
         "movement_dims": 3,             // Number of movement dimensions
         "movement_endpoints": [-0.3, 0.3, 0.4, 0.7, 0.1, 0.3] // Min/max per axis
@@ -67,30 +67,31 @@
     "multiprocessing"   : null,         // Optional multiprocessing config
 
     // ---------------- Active inference (AIF) ----------------
-    "aif_initial_random_steps"      : 10000,    // Steps of random actions before learning
-    "aif_model_update_freq"         : 200,     // World-model update frequency (steps)
+    "aif_initial_random_steps"      : 5000,    // Steps of random actions before learning
+    "aif_model_update_freq"         : 250,     // World-model update frequency (steps)
     "aif_model_train_epochs"        : 20,      // Number of epochs to train world model per update (like PETS)
-    "aif_policy_updates_per_step"   : 0,       // Policy updates per model update
+    "aif_policy_updates_per_step"   : 1,       // Policy updates per model update
     "aif_batch_size"                : 64,      // Replay batch size
-    "aif_model_lr"                  : 0.0001,   // World-model learning rate (PETS-like)
-    "aif_model_wd"                  : 0.01,   // World-model weight decay (PETS-like)
+    "aif_model_lr"                  : 0.0001,  // World-model learning rate (PETS-like)
+    "aif_model_wd"                  : 0.01,    // World-model weight decay (PETS-like)
     "aif_logvar_reg_weight"         : 0.0,     // Logvar bounds regularizer weight (PETS-like)
-    "aif_epistemic_scale"           : 0.1,    // Weight on epistemic term in EFE
+    "aif_epistemic_scale"           : 0.0,     // Weight on epistemic term in EFE
     "aif_replay_size"               : 100000,  // Replay buffer capacity
     "aif_gamma"                     : 1,       // Discount factor
     "aif_device"                    : "cpu",   // Torch device
     "aif_log_freq"                  : 500,     // Logging frequency (steps)
-    "aif_log_vfe_terms"             : true,    // Log variational free energy terms
+    "aif_log_vfe_terms"             : false,   // Log variational free energy terms
     "aif_log_efe_terms"             : true,    // Log expected free energy terms
-    "aif_plan_horizon"              : 20,      // Planning horizon H (shared by all planners)
-    "aif_optimisation_iters"        : 3,       // Simple CEM iterations
+    "aif_plan_horizon"              : 15,      // Planning horizon H (shared by all planners)
+    "aif_optimisation_iters"        : 2,       // Simple CEM iterations
     "aif_plan_candidates"           : 100,     // Population size for planning (CEM/policy planner)
     "aif_plan_elites"               : 10,      // Elite count for planning (CEM/policy planner)
-    "aif_plan_recompute_freq"       : 2,       // Replanning frequency (steps)
-    "aif_mc_models"                 : 5,       // MC samples over dynamics models
-    "aif_mc_trajectories"           : 2,      // MC trajectories per model sample
-    "aif_policy_mode"               : "icem",  // "cem"/"icem" use mbrl optimizers; "policy_net" uses amortized MPC; "simple_cem" uses legacy CEM
-    "fully_observable_mdp"          : true,   // Legacy flag; prefer aif_world_model.type
+    "aif_plan_recompute_freq"       : 3,       // Replanning frequency (steps)
+    "aif_mc_models"                 : 1,       // MC samples over dynamics models
+    "aif_mc_trajectories"           : 1,       // MC trajectories per model sample
+    "aif_policy_mode"               : "policy_net",  // "cem"/"icem" use mbrl optimizers; "policy_net" uses amortized MPC; "simple_cem" uses legacy CEM
+    "aif_policy_eval_mode"          : "plan",  // "plan" uses planning; "mean" uses policy_net mean (policy_net mode only)
+    "fully_observable_mdp"          : true,    // Legacy flag; prefer aif_world_model.type
     "aif_drop_goal_from_state"      : false,   // Remove goal slice from the model state (goal used only for preferences)
     "aif_pref_mean"                 : null,    // Fixed preference mean (or null to use goal each step)
     "aif_pref_std"                  : 0.5,     // Preference std (scalar or per-dim)
@@ -101,22 +102,23 @@
     "aif_policy_imagination_freq"   : 0,       // Frequency of imagined rollouts for policy
     "aif_policy_imagination_updates": 0,       // Number of imagined updates per trigger
     "aif_policy_imagination_horizon": 0,       // Horizon for imagined rollouts
-    "aif_policy_real_efe_freq"      : 0,       // Frequency of real-transition EFE policy updates (0 disables)
-    "aif_policy_real_efe_updates"   : 0,       // Number of real-transition updates (fallback to freq if null)
-    "aif_policy_elite_temperature"  : 0.0,     // Softmax temperature for elite weights (0 = uniform)
-    "aif_policy_net_update_steps"   : 0,       // Gradient steps per planning call
+    "aif_policy_real_efe_freq"      : 1,       // Frequency of real-transition EFE policy updates (0 disables)
+    "aif_policy_real_efe_updates"   : 1,       // Number of real-transition updates (fallback to freq if null)
+    "aif_policy_elite_temperature"  : 0.5,     // Softmax temperature for elite weights (0 = uniform)
+    "aif_policy_net_update_steps"   : 1,       // Gradient steps per planning call
     "aif_progress_bar"              : false,   // Show episode progress bars
-    "aif_policy_net_recompute_freq" : 0,       // MPC recompute frequency (steps)
-    "aif_policy_kl_beta"            : 0.0,     // KL weight for Bayesian policy
-    "aif_policy_posterior_mc_samples":  3,     // MC samples over policy posterior for distillation
+    "aif_policy_net_recompute_freq" : 2,       // MPC recompute frequency (steps)
+    "aif_policy_kl_beta"            : 0.1,     // KL weight for Bayesian policy
+    "aif_policy_posterior_mc_samples": 3,      // MC samples over policy posterior for distillation
     "aif_policy_efe_baseline_momentum": 0.9,   // EMA momentum for EFE baseline in single-sample updates
-    "aif_policy_plan_action_rollouts":  1,     // Action-noise rollouts per policy sample when planning
+    "aif_policy_plan_action_rollouts":  3,     // Action-noise rollouts per policy sample when planning
     "aif_world_model"               : {        // World-model settings
         "type": "pets",                        // "vae" (default), "bayesian", or "pets"
-        "ensemble_size": 5,                    // Number of dynamics ensemble members
+        "ensemble_size": 1,                    // Number of dynamics ensemble members
         "hid_size": 64                         // Hidden size for dynamics nets
     },
-    "aif_model_normalize"       : true,        // Normalize inputs/outputs for fully observable dynamics model
+    "aif_model_normalize"       : true,        // Normalize inputs for fully observable PETS/Bayesian dynamics
+    "aif_tensorboard_log"       : true,        // Log AIF metrics to TensorBoard (logdir/aif_tb)
     "aif_deterministic"         : false,       // Use deterministic dynamics model    
     "aif_use_mse_loss"          : false,       // If true, use MSE loss; if false, use Gaussian NLL loss    
     "aif_loss_weight_kl_state"  : 1.0,         // Weight on KL divergence between encoder and dynamics
@@ -129,7 +131,7 @@
     "icem_colored_noise_exponent"   :2.0,
     "icem_alpha"                    :0.25,
     "icem_return_mean_elites"       :true,
-    "aif_cem_clipped_normal"        :true,   // Use clipped normal distribution in CEM/ICEM 
+    "aif_cem_clipped_normal"        :true,      // Use clipped normal distribution in CEM/ICEM 
 
 
     // ---------------- Evaluation ----------------
