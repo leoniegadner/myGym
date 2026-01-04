@@ -25,6 +25,7 @@ import math
 import os
 import random
 from collections import deque
+from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
 
 import gymnasium as gym
@@ -43,6 +44,11 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+
+try:
+    from myGym.active_inference.meta_planning import MetaPlanningController
+except Exception:
+    MetaPlanningController = None
 
 try:
     import mbrl.planning as mbrl_planning
@@ -648,6 +654,7 @@ class LatentScalingAIFAgent(nn.Module):
         policy_elite_temperature: float = 0.0,
         policy_update_steps_per_plan: int = 1,
         policy_kl_beta: float = 1e-4,
+        policy_std_penalty_weight: float = 0.0,
         policy_posterior_mc_samples: int = 4,
         policy_efe_baseline_momentum: float = 0.9,
         policy_plan_action_rollouts: int = 1,
@@ -672,6 +679,7 @@ class LatentScalingAIFAgent(nn.Module):
         mbrl_optimizer_cfg: Optional[Dict[str, Dict[str, Any]]] = None,
         normalize_inputs: bool = False,
         normalize_double_precision: bool = False,
+        meta_cfg: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -793,11 +801,13 @@ class LatentScalingAIFAgent(nn.Module):
         self._policy_replan_counter = 0
         self._cached_policy_score: Optional[float] = None
         self._last_action_logprob: Optional[torch.Tensor] = None
+        self._last_policy_bc_info: Optional[Dict[str, float]] = None
         self._last_plan_sequence: Optional[torch.Tensor] = None
         self.policy_cem_elites = int(policy_cem_elites) if policy_cem_elites is not None else int(cem_num_elites)
         self.policy_elite_temperature = float(policy_elite_temperature)
         self.policy_update_steps_per_plan = max(0, int(policy_update_steps_per_plan))
         self.policy_kl_beta = float(policy_kl_beta)
+        self.policy_std_penalty_weight = float(policy_std_penalty_weight)
         self.policy_posterior_mc_samples = max(1, int(policy_posterior_mc_samples))
         self.policy_plan_action_rollouts = max(1, int(policy_plan_action_rollouts))
         # Running baseline for single-sample EFE updates to avoid zero advantage.
@@ -810,6 +820,7 @@ class LatentScalingAIFAgent(nn.Module):
         self._mbrl_optimizer_cfg: Dict[str, Dict[str, Any]] = mbrl_optimizer_cfg or {}
         self._mbrl_optimizer = None
         self._mbrl_optimizer_name: Optional[str] = None
+        self._mbrl_optimizer_horizon: Optional[int] = None
         self._mbrl_prev_solution = None
         self._warned_mbrl_missing = False
 
@@ -825,6 +836,17 @@ class LatentScalingAIFAgent(nn.Module):
         # Optional extra probability mass on the exact target (sharper component).
         self.pref_target_weight = float(pref_target_weight)
         self.pref_target_scale = float(pref_target_scale)
+
+        self._meta_controller = None
+        self._last_meta_info = None
+        self._cached_meta_override: Optional[Dict[str, Any]] = None
+        self._cached_meta_info: Optional[Dict[str, Any]] = None
+        self._meta_recompute_freq = max(1, int(meta_cfg.get("recompute_freq", 1))) if meta_cfg else 1
+        self._meta_step_counter = 0
+        self._meta_needs_recompute = False
+        self._meta_selection_count = 0
+        if MetaPlanningController is not None and meta_cfg is not None:
+            self._meta_controller = MetaPlanningController(self, meta_cfg.get("modes"), meta_cfg)
 
 
     def _init_preferences(self, pref_mean, pref_std):
@@ -1411,6 +1433,22 @@ class LatentScalingAIFAgent(nn.Module):
             return efe, risk, epistemic
         return efe
 
+    def _policy_std_penalty(self) -> torch.Tensor:
+        """
+        Compute a penalty term that encourages the policy std to decrease.
+
+        This creates gentle pressure for the policy to become more confident
+        over time, enabling transition to habitual/reactive modes.
+        """
+        if self.policy_std_penalty_weight <= 0.0:
+            return torch.tensor(0.0, device=self.device)
+        # Get the log_std parameter (fixed, not state-dependent)
+        log_std = self.policy_net.log_std
+        std = torch.exp(log_std)
+        # Penalty is mean std value - higher std = higher penalty
+        penalty = self.policy_std_penalty_weight * std.mean()
+        return penalty
+
     def update_policy_with_imagined_rollouts(
         self,
         replay_buffer,
@@ -1524,6 +1562,7 @@ class LatentScalingAIFAgent(nn.Module):
         adv = (discounted_efe - discounted_efe.mean()).detach()
         loss = (adv * log_probs.sum(dim=1)).mean()
         loss = loss + self.policy_kl_beta * self.policy_net.kl_loss()
+        loss = loss + self._policy_std_penalty()
         self.policy_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
@@ -1533,6 +1572,7 @@ class LatentScalingAIFAgent(nn.Module):
         out = {
             "policy_imag_efe": discounted_efe.mean().item(),
             "policy_imag_logprob": log_probs.sum(dim=1).mean().item(),
+            "policy_std": self.policy_net.log_std.exp().mean().item(),
         }
         if self.log_efe_terms and discounted_risk is not None and discounted_epistemic is not None:
             out.update(
@@ -1543,13 +1583,80 @@ class LatentScalingAIFAgent(nn.Module):
             )
         return out
 
-    def update_policy_with_real_efe(self, obs_np=None, action_np=None, next_obs_np=None):
+    def update_policy_from_planned_action(
+        self, obs_np: np.ndarray, planned_action: torch.Tensor, compute_weight: float = 1.0
+    ):
+        """
+        Train policy_net to imitate the best action from planning rollouts.
+
+        This is behavioral cloning from the planner: the policy learns to directly
+        output actions that the deliberative planner would choose. High-compute plans
+        (which explore more thoroughly) update the policy more strongly.
+
+        Args:
+            obs_np: Current observation [obs_dim]
+            planned_action: Best first action from planning rollouts [action_dim]
+            compute_weight: Scaling factor proportional to planning complexity.
+                High-compute plans → stronger update; deterministic (weight=0) → skip.
+        """
+        if compute_weight <= 0.0:
+            return None  # Skip for deterministic mode
+        if obs_np is None or planned_action is None:
+            return None
+
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        target_action = planned_action.detach().unsqueeze(0) if planned_action.dim() == 1 else planned_action.detach()
+
+        # Encode observation to latent state
+        with torch.no_grad():
+            if self.fully_observable_mdp:
+                s = obs
+            else:
+                mu, logvar = self.encoder(obs)
+                s = mu  # Use mean for stability
+
+        # Get policy output
+        policy_eps = self.policy_net.sample_eps()
+        mean, std = self.policy_net(s, eps_cache=policy_eps)
+
+        # Behavioral cloning loss: maximize log prob of planned action under policy
+        log_prob = self.policy_net.log_prob_action(
+            target_action, mean, std, self.action_low, self.action_high
+        )
+
+        # Scale loss by compute_weight: high-compute plans → stronger habituation
+        loss = -compute_weight * log_prob.mean()  # Negative because we maximize log prob
+        loss = loss + compute_weight * self.policy_kl_beta * self.policy_net.kl_loss()
+        loss = loss + compute_weight * self._policy_std_penalty()
+
+        self.policy_optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
+        self._zero_non_policy_grads()
+        self.policy_optimizer.step()
+
+        return {
+            "policy_bc_logprob": log_prob.mean().item(),
+            "policy_bc_compute_weight": compute_weight,
+            "policy_std": self.policy_net.log_std.exp().mean().item(),
+        }
+
+    def update_policy_with_real_efe(
+        self, obs_np=None, action_np=None, next_obs_np=None, compute_weight: float = 1.0
+    ):
         """
         Train policy_net on real transitions by minimizing expected free energy.
         If next_obs_np is provided, compute the risk directly from the real next
         observation (masked preference distance) instead of relying on model
         predictions. Uses on-policy (latest) transition; off-policy replay is avoided.
+
+        Args:
+            compute_weight: Scaling factor for the policy update, proportional to planning
+                compute cost. High-compute plans update policy more strongly (habituating
+                deliberative actions); deterministic plans (weight=0) skip the update.
         """
+        if compute_weight <= 0.0:
+            return None  # Skip update for deterministic/zero-compute plans
         if obs_np is None or action_np is None:
             return None
 
@@ -1643,8 +1750,11 @@ class LatentScalingAIFAgent(nn.Module):
                 + (1.0 - self._policy_efe_baseline_momentum) * efe_detached.mean()
             )
         adv = (efe - self._policy_efe_baseline).detach()
-        loss = (adv * log_prob).mean()
-        loss = loss + self.policy_kl_beta * self.policy_net.kl_loss()
+        # Scale loss by compute_weight: high-compute plans → stronger policy update
+        # This habituates deliberative actions more than reactive ones
+        loss = compute_weight * (adv * log_prob).mean()
+        loss = loss + compute_weight * self.policy_kl_beta * self.policy_net.kl_loss()
+        loss = loss + compute_weight * self._policy_std_penalty()
         self.policy_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
@@ -1654,6 +1764,8 @@ class LatentScalingAIFAgent(nn.Module):
         out = {
             "policy_real_efe": efe.mean().item(),
             "policy_real_logprob": log_prob.mean().item(),
+            "policy_std": self.policy_net.log_std.exp().mean().item(),
+            "policy_compute_weight": compute_weight,
         }
         if self.log_efe_terms:
             out.update(
@@ -1773,6 +1885,19 @@ class LatentScalingAIFAgent(nn.Module):
                 s = mu + torch.exp(0.5 * logvar) * eps  # [1, latent_dim]
             return s.squeeze(0)  # [latent_dim]
 
+    def _infer_latent_mean(self, obs_np):
+        """
+        Deterministic latent mean used for uncertainty estimation.
+        """
+        with torch.no_grad():
+            o = torch.tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+            if self.fully_observable_mdp:
+                s = o
+            else:
+                mu, _ = self.encoder(o)
+                s = mu
+            return s.squeeze(0)
+
     def policy_net_mean_action(self, obs_np: np.ndarray) -> torch.Tensor:
         """
         Return the deterministic policy action from the policy_net mean.
@@ -1788,7 +1913,60 @@ class LatentScalingAIFAgent(nn.Module):
             action, _, _ = self.policy_net._squash(mean, self.action_low, self.action_high)
             return action.squeeze(0)
 
-    def plan_action(self, obs_np):
+    @contextmanager
+    def _temporary_planning_override(self, override: Optional[Dict[str, Any]]):
+        if not override:
+            yield
+            return
+        old_vals: Dict[str, Any] = {}
+
+        def _set_attr(attr: str, value: Any):
+            if attr not in old_vals:
+                old_vals[attr] = getattr(self, attr)
+            setattr(self, attr, value)
+
+        if "aif_plan_horizon" in override and override["aif_plan_horizon"] is not None:
+            horizon = max(1, int(override["aif_plan_horizon"]))
+            _set_attr("cem_horizon", horizon)
+            _set_attr("policy_plan_horizon", horizon)
+
+        if "aif_plan_candidates" in override and override["aif_plan_candidates"] is not None:
+            candidates = max(1, int(override["aif_plan_candidates"]))
+            _set_attr("cem_num_samples", candidates)
+            _set_attr("policy_plan_samples", candidates)
+            _set_attr("cem_num_elites", min(int(self.cem_num_elites), candidates))
+            _set_attr("policy_cem_elites", min(int(self.policy_cem_elites), candidates))
+
+        if "aif_mc_models" in override and override["aif_mc_models"] is not None:
+            _set_attr("mc_num_models", max(1, int(override["aif_mc_models"])))
+
+        if "aif_mc_trajectories" in override and override["aif_mc_trajectories"] is not None:
+            _set_attr("mc_num_trajectories", max(1, int(override["aif_mc_trajectories"])))
+
+        if "aif_policy_plan_action_rollouts" in override and override["aif_policy_plan_action_rollouts"] is not None:
+            _set_attr("policy_plan_action_rollouts", max(1, int(override["aif_policy_plan_action_rollouts"])))
+
+        try:
+            yield
+        finally:
+            for attr, value in old_vals.items():
+                setattr(self, attr, value)
+
+    def _print_meta_selection(self, info: Optional[Dict[str, Any]]) -> None:
+        if not info:
+            return
+        horizon = info.get("meta_plan_horizon", 0)
+        candidates = info.get("meta_plan_candidates", 0)
+        mc_models = info.get("meta_mc_models", 0)
+        mc_traj = info.get("meta_mc_trajectories", 0)
+        rollouts = info.get("meta_action_rollouts", 0)
+        deterministic = bool(info.get("meta_deterministic", False))
+        print(
+            f"[AIF][meta] H={horizon} N={candidates} M={mc_models} "
+            f"T={mc_traj} R={rollouts} det={deterministic}"
+        )
+
+    def plan_action(self, obs_np, plan_override: Optional[Dict[str, Any]] = None):
         """
         Plan an action from current observation using CEM in latent space.
 
@@ -1803,30 +1981,79 @@ class LatentScalingAIFAgent(nn.Module):
         max_cached_steps = 0
         if cached_seq is not None and cached_seq.ndim == 2:
             max_cached_steps = min(self.policy_recompute_freq, int(cached_seq.shape[0]))
+
+        meta_override = {}
+        meta_info = None
+        if self._meta_controller is not None and getattr(self._meta_controller, "enabled", False):
+            if self._cached_meta_override is None or self._meta_needs_recompute:
+                self._cached_meta_override, self._cached_meta_info = self._meta_controller.select_mode(obs_np)
+                self._meta_needs_recompute = False
+                self._meta_selection_count += 1
+                self._print_meta_selection(self._cached_meta_info)
+            meta_override = dict(self._cached_meta_override or {})
+            meta_info = dict(self._cached_meta_info or {})
+            self._last_meta_info = meta_info
+            self._meta_step_counter += 1
+            if self._meta_step_counter >= self._meta_recompute_freq:
+                self._meta_needs_recompute = True
+                self._meta_step_counter = 0
+        else:
+            self._last_meta_info = None
+
         if cached_seq is not None and self._policy_replan_counter < max_cached_steps:
             a0 = cached_seq[self._policy_replan_counter]
             self._policy_replan_counter += 1
             self._cached_policy_action = a0
         else:
             self._last_plan_sequence = None
-            if mode == "policy_net":
-                a0, best_score, logprob0 = self._plan_action_with_policy_net_sampling(s0)
-                self._cached_policy_score = best_score
-                self._last_action_logprob = logprob0
+            if plan_override:
+                meta_override = dict(meta_override)
+                meta_override.update(plan_override)
+
+            deterministic_meta = bool(meta_info.get("meta_deterministic")) if meta_info else False
+            if deterministic_meta:
+                # Clear stale BC metrics when we skip planning/habituation.
+                self._last_policy_bc_info = None
+                a0 = self.policy_net_mean_action(obs_np)
+                self._cached_policy_score = None
+                self._last_action_logprob = None
+                self._last_plan_sequence = a0.unsqueeze(0)
             else:
-                with torch.no_grad():
-                    if mode in ("cem", "icem"):
-                        a0 = self._plan_action_with_mbrl_optimizer(s0, mode)
-                        self._cached_policy_score = self._last_plan_score_best
-                        self._last_action_logprob = None
-                    elif mode == "simple_cem":
-                        a0 = self._plan_action_with_simple_cem(s0)
-                        self._cached_policy_score = None
-                        self._last_action_logprob = None
+                with self._temporary_planning_override(meta_override):
+                    if mode == "policy_net":
+                        a0, best_score, logprob0 = self._plan_action_with_policy_net_sampling(s0)
+                        self._cached_policy_score = best_score
+                        self._last_action_logprob = logprob0
                     else:
-                        a0 = self._plan_action_with_simple_cem(s0)
-                        self._cached_policy_score = None
-                        self._last_action_logprob = None
+                        with torch.no_grad():
+                            if mode in ("cem", "icem"):
+                                a0 = self._plan_action_with_mbrl_optimizer(s0, mode)
+                                self._cached_policy_score = self._last_plan_score_best
+                                self._last_action_logprob = None
+                            elif mode == "simple_cem":
+                                a0 = self._plan_action_with_simple_cem(s0)
+                                self._cached_policy_score = None
+                                self._last_action_logprob = None
+                            else:
+                                a0 = self._plan_action_with_simple_cem(s0)
+                                self._cached_policy_score = None
+                                self._last_action_logprob = None
+
+
+                # Train policy to imitate the planned best action (behavioral cloning from planner)
+                # Compute weight proportional to planning complexity (normalized)
+                compute_weight = 0.0
+                if meta_info and self._meta_controller is not None:
+                    meta_cost = float(meta_info.get("meta_compute_cost_selected", 0.0))
+                    max_cost = self._meta_controller.max_complexity
+                    compute_weight = meta_cost / max(max_cost, 1e-6)
+                if compute_weight > 0.0:
+                    self._last_policy_bc_info = self.update_policy_from_planned_action(
+                        obs_np, a0, compute_weight=compute_weight
+                    )
+                else:
+                    self._last_policy_bc_info = None
+
             plan_seq = self._last_plan_sequence
             if plan_seq is None:
                 plan_seq = a0.unsqueeze(0)
@@ -2109,7 +2336,11 @@ class LatentScalingAIFAgent(nn.Module):
     def _get_mbrl_optimizer(self, optimizer_name: str, horizon: int):
         if mbrl_planning is None:
             return None
-        if self._mbrl_optimizer is not None and self._mbrl_optimizer_name == optimizer_name:
+        if (
+            self._mbrl_optimizer is not None
+            and self._mbrl_optimizer_name == optimizer_name
+            and self._mbrl_optimizer_horizon == int(horizon)
+        ):
             return self._mbrl_optimizer
         optimizer_cls = getattr(
             mbrl_planning, "CEMOptimizer" if optimizer_name == "cem" else "ICEMOptimizer", None
@@ -2150,6 +2381,7 @@ class LatentScalingAIFAgent(nn.Module):
             base_cfg.update({k: v for k, v in overrides.items() if v is not None})
         self._mbrl_optimizer = self._instantiate_mbrl_optimizer(optimizer_cls, base_cfg)
         self._mbrl_optimizer_name = optimizer_name
+        self._mbrl_optimizer_horizon = int(horizon)
         return self._mbrl_optimizer
 
     def _mbrl_optimize(self, optimizer, objective_fn, lower_bound, upper_bound):
@@ -2518,6 +2750,7 @@ class LatentScalingAIFAgent(nn.Module):
 
             loss = -(torch.stack(loss_terms).sum() / (weights.sum() + 1e-8))
             loss = loss + self.policy_kl_beta * self.policy_net.kl_loss()
+            loss = loss + self._policy_std_penalty()
             self.policy_optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=10.0)
@@ -2584,6 +2817,16 @@ class LatentScalingAIFAgent(nn.Module):
         self._last_action_logprob = None
         self._last_plan_sequence = None
         self._mbrl_prev_solution = None
+        self._last_meta_info = None
+        self._cached_meta_override = None
+        self._cached_meta_info = None
+        self._meta_step_counter = 0
+        self._meta_needs_recompute = True
+
+    def update_meta_stats(self, obs_np: np.ndarray, action_np: np.ndarray, next_obs_np: np.ndarray) -> None:
+        if self._meta_controller is None or not getattr(self._meta_controller, "enabled", False):
+            return
+        self._meta_controller.update_from_transition(obs_np, action_np, next_obs_np)
 
 
 # ======================================================================
@@ -2658,6 +2901,37 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_policy_posterior_mc_samples", 4)
         self.arg_dict.setdefault("aif_policy_efe_baseline_momentum", 0.9)
         self.arg_dict.setdefault("aif_policy_plan_action_rollouts", 1)
+        self.arg_dict.setdefault("aif_meta_enabled", False)
+        self.arg_dict.setdefault("aif_meta_selection", "greedy")
+        self.arg_dict.setdefault("aif_meta_softmax_temp", 1.0)
+        self.arg_dict.setdefault("aif_meta_allow_deterministic", False)
+        self.arg_dict.setdefault("aif_meta_mode_count", 3)
+        self.arg_dict.setdefault("aif_meta_modes", None)
+        self.arg_dict.setdefault("aif_meta_max_modes", None)
+        self.arg_dict.setdefault("aif_meta_recompute_freq", 1)
+        self.arg_dict.setdefault("aif_meta_cost_log", True)
+        self.arg_dict.setdefault("aif_meta_cost_weight", 1.0)
+        self.arg_dict.setdefault("aif_meta_habit_weight", 1.0)
+        self.arg_dict.setdefault("aif_meta_model_ambiguity_weight", 1.0)
+        self.arg_dict.setdefault("aif_meta_w_success", 1.0)
+        self.arg_dict.setdefault("aif_meta_p_pref_success", 0.9)
+        self.arg_dict.setdefault("aif_meta_w_epistemic", 1.0)
+        self.arg_dict.setdefault("aif_meta_gate_reliability_threshold", 0.3)
+        self.arg_dict.setdefault("aif_meta_gate_k", 10.0)
+        self.arg_dict.setdefault("aif_meta_gate_theta_threshold", None)
+        self.arg_dict.setdefault("aif_meta_gate_k2", 10.0)
+        self.arg_dict.setdefault("aif_meta_planning_load_ambiguity_scale", 0.1)
+        self.arg_dict.setdefault("aif_meta_error_ema_beta", 0.9)
+        self.arg_dict.setdefault("aif_meta_uncert_ema_beta", 0.9)
+        self.arg_dict.setdefault("aif_meta_policy_uncert_ema_beta", 0.9)
+        self.arg_dict.setdefault("aif_meta_uncertainty_probe_actions", 3)
+        self.arg_dict.setdefault("aif_meta_uncertainty_action_noise", 0.1)
+        self.arg_dict.setdefault("aif_meta_policy_uncertainty_samples", None)
+        self.arg_dict.setdefault("aif_meta_horizon_step", 1)
+        self.arg_dict.setdefault("aif_meta_candidates_step", 1)
+        self.arg_dict.setdefault("aif_meta_mc_models_step", 1)
+        self.arg_dict.setdefault("aif_meta_mc_trajectories_step", 1)
+        self.arg_dict.setdefault("aif_meta_action_rollouts_step", 1)
         self.arg_dict.setdefault("aif_tensorboard_log", True)
         self.arg_dict.setdefault("aif_loss_weight_kl_state", 1.0)
         self.arg_dict.setdefault("aif_loss_weight_nll_obs", 1.0)
@@ -2735,6 +3009,66 @@ class ActiveInferenceSB3:
         if mc_models is None:
             mc_models = ensemble_size
         self.arg_dict["aif_mc_models"] = mc_models
+        meta_policy_samples = self.arg_dict.get("aif_meta_policy_uncertainty_samples")
+        if meta_policy_samples is None:
+            meta_policy_samples = self.arg_dict.get("aif_policy_posterior_mc_samples", 4)
+        meta_cfg = {
+            "enabled": bool(self.arg_dict.get("aif_meta_enabled", False)),
+            "selection": self.arg_dict.get("aif_meta_selection", "greedy"),
+            "softmax_temp": self.arg_dict.get("aif_meta_softmax_temp", 1.0),
+            "allow_deterministic": bool(self.arg_dict.get("aif_meta_allow_deterministic", False)),
+            "mode_count": self.arg_dict.get("aif_meta_mode_count", 3),
+            "modes": self.arg_dict.get("aif_meta_modes"),
+            "max_modes": self.arg_dict.get("aif_meta_max_modes"),
+            "recompute_freq": self.arg_dict.get("aif_meta_recompute_freq", 1),
+            "horizon_min": self.arg_dict.get("aif_meta_horizon_min", self.arg_dict.get("aif_plan_horizon", 20)),
+            "horizon_max": self.arg_dict.get("aif_meta_horizon_max", self.arg_dict.get("aif_plan_horizon", 20)),
+            "candidates_min": self.arg_dict.get("aif_meta_candidates_min", self.arg_dict.get("aif_plan_candidates", 64)),
+            "candidates_max": self.arg_dict.get("aif_meta_candidates_max", self.arg_dict.get("aif_plan_candidates", 64)),
+            "mc_models_min": self.arg_dict.get("aif_meta_mc_models_min", mc_models),
+            "mc_models_max": self.arg_dict.get("aif_meta_mc_models_max", mc_models),
+            "mc_trajectories_min": self.arg_dict.get("aif_meta_mc_trajectories_min", mc_traj),
+            "mc_trajectories_max": self.arg_dict.get("aif_meta_mc_trajectories_max", mc_traj),
+            "action_rollouts_min": self.arg_dict.get(
+                "aif_meta_action_rollouts_min", self.arg_dict.get("aif_policy_plan_action_rollouts", 1)
+            ),
+            "action_rollouts_max": self.arg_dict.get(
+                "aif_meta_action_rollouts_max", self.arg_dict.get("aif_policy_plan_action_rollouts", 1)
+            ),
+            "horizon_step": self.arg_dict.get("aif_meta_horizon_step", 1),
+            "candidates_step": self.arg_dict.get("aif_meta_candidates_step", 1),
+            "mc_models_step": self.arg_dict.get("aif_meta_mc_models_step", 1),
+            "mc_trajectories_step": self.arg_dict.get("aif_meta_mc_trajectories_step", 1),
+            "action_rollouts_step": self.arg_dict.get("aif_meta_action_rollouts_step", 1),
+            "cost_log": bool(self.arg_dict.get("aif_meta_cost_log", True)),
+            "cost_weight": self.arg_dict.get("aif_meta_cost_weight", 1.0),
+            "habit_weight": self.arg_dict.get("aif_meta_habit_weight", 1.0),
+            "model_ambiguity_weight": self.arg_dict.get("aif_meta_model_ambiguity_weight", 1.0),
+            "meta_w_success": self.arg_dict.get("aif_meta_w_success", 1.0),
+            "meta_p_pref_success": self.arg_dict.get("aif_meta_p_pref_success", 0.9),
+            "meta_w_epistemic": self.arg_dict.get("aif_meta_w_epistemic", 1.0),
+            "meta_gate_reliability_threshold": self.arg_dict.get("aif_meta_gate_reliability_threshold", 0.3),
+            "meta_gate_k": self.arg_dict.get("aif_meta_gate_k", 10.0),
+            "meta_gate_theta_threshold": self.arg_dict.get("aif_meta_gate_theta_threshold"),
+            "meta_gate_k2": self.arg_dict.get("aif_meta_gate_k2", 10.0),
+            "planning_load_ambiguity_scale": self.arg_dict.get("aif_meta_planning_load_ambiguity_scale", 0.1),
+            "error_ema_beta": self.arg_dict.get("aif_meta_error_ema_beta", 0.9),
+            "uncert_ema_beta": self.arg_dict.get("aif_meta_uncert_ema_beta", 0.9),
+            "policy_uncert_ema_beta": self.arg_dict.get("aif_meta_policy_uncert_ema_beta", 0.9),
+            "uncertainty_probe_actions": self.arg_dict.get("aif_meta_uncertainty_probe_actions", 3),
+            "uncertainty_action_noise": self.arg_dict.get("aif_meta_uncertainty_action_noise", 0.1),
+            "policy_uncertainty_samples": meta_policy_samples,
+            "warmup_transitions": self.arg_dict.get("aif_meta_warmup_transitions", 100),
+            "update_model_before_meta": (
+                str(self.arg_dict.get("aif_model_update_freq", "")).lower() == "meta_update"
+            ),
+            "debug": bool(self.arg_dict.get("aif_meta_debug", False)),
+            # Initial EMA values (pessimistic to favor reactive modes at start)
+            "initial_model_error": self.arg_dict.get("aif_meta_initial_model_error", 2.0),
+            "initial_model_uncert": self.arg_dict.get("aif_meta_initial_model_uncert", 1.0),
+            "initial_policy_uncert": self.arg_dict.get("aif_meta_initial_policy_uncert", 1.0),
+            "initial_risk": self.arg_dict.get("aif_meta_initial_risk", 1.0),
+        }
 
         obs_dim = self._infer_obs_dim(self.observation_space)
         if self._drop_goal_from_state and self._obs_layout and "goal" in self._obs_layout:
@@ -2786,6 +3120,7 @@ class ActiveInferenceSB3:
             policy_elite_temperature=self.arg_dict.get("aif_policy_elite_temperature", 0.0),
             policy_update_steps_per_plan=self.arg_dict.get("aif_policy_net_update_steps", 0),
             policy_kl_beta=self.arg_dict.get("aif_policy_kl_beta", 1e-4),
+            policy_std_penalty_weight=self.arg_dict.get("aif_policy_std_penalty_weight", 0.0),
             policy_posterior_mc_samples=self.arg_dict.get("aif_policy_posterior_mc_samples", 4),
             policy_efe_baseline_momentum=self.arg_dict.get("aif_policy_efe_baseline_momentum", 0.9),
             policy_plan_action_rollouts=self.arg_dict.get("aif_policy_plan_action_rollouts", 1),
@@ -2809,21 +3144,31 @@ class ActiveInferenceSB3:
             dynamics_logvar_max=dynamics_logvar_max,
             mbrl_optimizer_cfg=mbrl_optimizer_cfg,
             normalize_inputs=bool(self.arg_dict.get("aif_model_normalize", False)),
+            meta_cfg=meta_cfg,
         )
 
         self.replay_buffer = ReplayBuffer(self.arg_dict["aif_replay_size"])
         self.initial_random_steps = int(self.arg_dict["aif_initial_random_steps"])
-        self.model_update_freq = int(self.arg_dict["aif_model_update_freq"])
+        # Handle "meta_update" mode: model updates triggered by meta controller, not by step count
+        _model_update_freq = self.arg_dict.get("aif_model_update_freq", 250)
+        if str(_model_update_freq).lower() == "meta_update":
+            self.model_update_freq = 0  # Disable step-based updates (meta controller handles it)
+        else:
+            self.model_update_freq = int(_model_update_freq)
         self.model_updates_per_step = int(self.arg_dict.get("aif_model_updates_per_step", 1))
         self.policy_updates_per_step = int(self.arg_dict["aif_policy_updates_per_step"])
         self.log_freq = int(self.arg_dict.get("aif_log_freq", 0) or 0)
         self.batch_size = int(self.arg_dict.get("aif_batch_size", 64))
+        # Store references on agent for meta controller's model updates
+        self.agent._meta_replay_buffer = self.replay_buffer
+        self.agent._meta_batch_size = self.batch_size
         self.num_timesteps = 0
         self._latest_update_info: Optional[Dict[str, float]] = None
         self._progress_bar_enabled = bool(self.arg_dict.get("aif_progress_bar", False))
         self._episode_pbar = None
         self._warned_no_tqdm = False
         self._model_update_debug_printed = False
+        self._last_meta_selection_count = 0
         self._max_episode_steps = int(
             self.arg_dict.get("max_episode_steps")
             or getattr(getattr(self.env, "env", None), "_max_episode_steps", 0)
@@ -3274,7 +3619,12 @@ class ActiveInferenceSB3:
             buffer_ready = len(self.replay_buffer) >= self.batch_size
             log_info = {}
             if buffer_ready and not is_random_step:
-                if is_first_policy_step or self.num_timesteps % self.model_update_freq == 0:
+                # model_update_freq=0 means step-based updates disabled (meta controller handles it)
+                step_based_update = (
+                    self.model_update_freq > 0
+                    and (is_first_policy_step or self.num_timesteps % self.model_update_freq == 0)
+                )
+                if step_based_update:
                     last_info = None
                     model_updates = max(1, int(self.model_updates_per_step))
                     for _ in range(model_updates):
@@ -3333,34 +3683,67 @@ class ActiveInferenceSB3:
                 float(reward),
                 float(done),
             )
+            self.agent.update_meta_stats(
+                flat_obs,
+                np.asarray(action, dtype=np.float32),
+                flat_next_obs,
+            )
             self.num_timesteps += 1
             buffer_ready = len(self.replay_buffer) >= self.batch_size
+
+            meta_count = getattr(self.agent, "_meta_selection_count", 0)
+            if meta_count != self._last_meta_selection_count:
+                self._last_meta_selection_count = meta_count
+                meta_info = getattr(self.agent, "_last_meta_info", None)
+                if meta_info:
+                    meta_metrics = {f"aif_meta/{k}": v for k, v in meta_info.items() if v is not None}
+                    self._log_tb_metrics(meta_metrics, self.num_timesteps)
+
+            # Skip policy learning in deterministic/habitual mode
+            # (no useful planning signal when just executing policy mean)
+            # NOTE: Get meta_info directly from agent, not from the logging block above
+            current_meta_info = getattr(self.agent, "_last_meta_info", None)
+            is_deterministic_mode = bool(current_meta_info.get("meta_deterministic", False)) if current_meta_info else False
+
+            # Debug: log when skipping policy learning due to deterministic mode
+            if is_deterministic_mode and self.num_timesteps % 500 == 0:
+                print(f"[AIF] step {self.num_timesteps}: Skipping policy learning (deterministic mode)")
 
             # Optional imagined rollouts to train policy_net
             pol_freq = int(self.arg_dict.get("aif_policy_imagination_freq", 0) or 0)
             pol_updates = int(self.arg_dict.get("aif_policy_imagination_updates", 1) or 1)
             if pol_freq > 0 and self.num_timesteps >= self.initial_random_steps and self.num_timesteps % pol_freq == 0:
-                horizon = self.arg_dict.get("aif_policy_imagination_horizon", None)
-                pol_info = None
-                for _ in range(pol_updates):
-                    pol_info = self.agent.update_policy_with_imagined_rollouts(
-                        self.replay_buffer,
-                        batch_size=self.batch_size,
-                        rollout_horizon=horizon or self.arg_dict.get("aif_plan_horizon", self.agent.cem_horizon),
-                    )
-                if pol_info and self.arg_dict.get("aif_log_efe_terms", False):
-                    log_info.update({f"{k}": v for k, v in pol_info.items()})
+                if not is_deterministic_mode:  # Skip in deterministic mode
+                    horizon = self.arg_dict.get("aif_policy_imagination_horizon", None)
+                    pol_info = None
+                    for _ in range(pol_updates):
+                        pol_info = self.agent.update_policy_with_imagined_rollouts(
+                            self.replay_buffer,
+                            batch_size=self.batch_size,
+                            rollout_horizon=horizon or self.arg_dict.get("aif_plan_horizon", self.agent.cem_horizon),
+                        )
+                    if pol_info and self.arg_dict.get("aif_log_efe_terms", False):
+                        log_info.update({f"{k}": v for k, v in pol_info.items()})
 
             # Optional policy_net updates using real transitions scored by EFE
+            # Compute weight: proportional to planning cost (high-compute → stronger update)
             real_efe_freq = int(self.arg_dict.get("aif_policy_real_efe_freq", 0) or 0)
             real_efe_updates = int(self.arg_dict.get("aif_policy_real_efe_updates", 1) or 1)
             real_info = None
             if real_efe_freq > 0 and self.num_timesteps >= self.initial_random_steps and self.num_timesteps % real_efe_freq == 0:
+                # Compute normalized weight from meta planning cost
+                compute_weight = 0.0
+                if current_meta_info and not is_deterministic_mode:
+                    meta_cost = float(current_meta_info.get("meta_compute_cost_selected", 0.0))
+                    meta_ctrl = getattr(self.agent, "meta_controller", None)
+                    max_cost = meta_ctrl.max_complexity if meta_ctrl else 1.0
+                    compute_weight = meta_cost / max(max_cost, 1e-6)
                 for _ in range(real_efe_updates):
                     real_info = self.agent.update_policy_with_real_efe(
                         obs_np=self._last_onpolicy_obs,
                         action_np=self._last_onpolicy_action,
                         next_obs_np=flat_next_obs,
+                        compute_weight=compute_weight,
                     )
                 if real_info and self.arg_dict.get("aif_log_efe_terms", False):
                     log_info.update(real_info)
@@ -3373,6 +3756,10 @@ class ActiveInferenceSB3:
                     action_logprob = getattr(self.agent, "_last_action_logprob", None)
                     if action_logprob is not None:
                         log_info["policy_action_logprob"] = float(action_logprob.detach().cpu().item())
+                    # Log policy behavioral cloning from planned actions
+                    bc_info = getattr(self.agent, "_last_policy_bc_info", None)
+                    if bc_info:
+                        log_info.update({f"policy_bc/{k}": v for k, v in bc_info.items()})
                     with torch.no_grad():
                         state_t = torch.as_tensor(flat_obs, dtype=torch.float32, device=self.agent.device).unsqueeze(0)
                         if not self.agent.fully_observable_mdp:
@@ -3383,6 +3770,13 @@ class ActiveInferenceSB3:
                         log_info["policy_std"] = std.squeeze(0).detach().cpu().numpy().tolist()
                         entropy = (0.5 * (1.0 + math.log(2 * math.pi)) + torch.log(std)).sum(dim=-1)
                         log_info["policy_entropy"] = float(entropy.item())
+                # Add meta controller EMAs to log output
+                meta_ctrl = getattr(self.agent, "meta_controller", None)
+                if meta_ctrl is not None and meta_ctrl.enabled:
+                    log_info["model_error_ema"] = float(meta_ctrl.model_error_ema)
+                    log_info["model_uncert_ema"] = float(meta_ctrl.model_uncert_ema)
+                    log_info["policy_uncert_ema"] = float(meta_ctrl.policy_uncert_ema)
+                    # Note: Task-level risk_ema removed. Meta-risk is now pre-computed per mode.
                 if log_info:
                     tb_metrics = {f"aif/{k}": v for k, v in log_info.items()}
                     self._log_tb_metrics(tb_metrics, self.num_timesteps)
@@ -3590,4 +3984,9 @@ class MetaAIFSB3(ActiveInferenceSB3):
 
     def __init__(self, env: gym.Env, arg_dict: Optional[Dict[str, Any]] = None, device: Optional[str] = None, **kwargs):
         print("MetaAIFSB3 currently reuses ActiveInferenceSB3 behaviour.")
+        if arg_dict is None:
+            arg_dict = {}
+        if "aif_meta_enabled" not in arg_dict:
+            arg_dict = dict(arg_dict)
+            arg_dict["aif_meta_enabled"] = True
         super().__init__(env, arg_dict=arg_dict, device=device, **kwargs)
