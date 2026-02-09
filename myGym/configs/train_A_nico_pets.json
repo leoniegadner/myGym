@@ -40,8 +40,8 @@
     "train_framework"   :"pytorch",
     "algo"              :"pets",
     "max_episode_steps" :512,
-    "steps"             :15000,
-    "pretrained_model"  :null,
+    "steps"             :1500000,
+    "pretrained_model"  :"/Users/Leonie/Desktop/Robot_Nico_Project/Project/myGym/myGym/trained_models/nico_grasp/A/joints_gripper_pets_24",
     "multiprocessing"   :null,
     // PETS policy distillation
     "pets_policy_mimic"     : false,
@@ -74,8 +74,8 @@
     "mppi_gamma"        :1.0,  
     "mppi_sigma"        :1.0,
     "mppi_beta"         :0.9,
-    "mppi_lambda"       :1.0,  // kept for backward compatibility; maps to gamma if mppi_gamma not set
-    "icem_num_iters"    :3, // 3
+    "mppi_lambda"       :1.0,   // kept for backward compatibility; maps to gamma if mppi_gamma not set
+    "icem_num_iters"    :3,     // 3
     "icem_population_size":100, // 100
     "icem_elite_ratio"  :0.1,
     "icem_population_decay_factor":1.25,
@@ -84,8 +84,8 @@
     "icem_alpha"        :0.1,
     "icem_return_mean_elites":true,
     #Evaluation
-    "eval_freq"     :1000,
-    "eval_episodes" :5,
+    "eval_freq"     :15000,
+    "eval_episodes" :10,
     #Saving and logging
     "record"    :0
     }

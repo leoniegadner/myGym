@@ -1,12 +1,12 @@
 """
 Latent-state (partially observed) variant of an Amortized AIF Agent, as in
-'Scaling Active Inference' [CITE!!!].
+'Scaling Active Inference' TODO: [CITE!!!].
 
 Key components:
 - Encoder:       q_phi(s_t | o_t)  = N(mu_phi(o_t), diag(exp(logvar_phi(o_t))))
 - Decoder:       p_lambda(o_t | s_t) = N(mu_lambda(s_t), diag(exp(logvar_lambda(s_t))))
 - Dynamics:      p_theta(s_{t+1} | s_t, a_t, theta) as a Bayesian NN
-- Preferences:   p_pref(o_t) captures desired observations / features
+- Preferences:   p(o_t | C) captures desired observations / features
 
 Training objective per transition (o_{t-1}, a_{t-1}, o_t):
 
@@ -15,8 +15,17 @@ F_t ~= E_{q(theta)} E_{q(s_{t-1}|o_{t-1})} KL[ q(s_t|o_t) || p(s_t|s_{t-1}, a_{t
        - E_{q(s_t|o_t)} [ log p(o_t | s_t) ]
 
 We approximate expectations via Monte Carlo (reparameterization).
-Planning uses CEM over action sequences in latent space, minimizing expected free
-energy (risk to preferences minus epistemic value) under model uncertainty.
+
+Expected Free Energy (EFE) for action selection:
+  -G = Extrinsic Value + State Info Gain + Parameter Info Gain
+
+Where:
+  - Extrinsic Value = E_q(o|π)[ln p(o|C)]  (pragmatic value)
+  - State Info Gain = I(s; o | π)  (state information gain)
+  - Parameter Info Gain = I(θ; s | π)  (parameter/model information gain)
+
+Planning uses CEM over action sequences in latent space, minimizing G under
+model uncertainty. Ensemble disagreement serves as proxy for information gain.
 """
 
 import inspect
@@ -608,7 +617,7 @@ class ReplayBuffer:
 #  Latent Scaling Active Inference Agent
 # ======================================================================
 
-class LatentScalingAIFAgent(nn.Module):
+class AIFAgent(nn.Module):
     """
     Latent-state (partially observed) variant.
 
@@ -637,8 +646,8 @@ class LatentScalingAIFAgent(nn.Module):
         mc_num_trajectories=3,
         kl_theta_beta=1.0,
         policy_mode="cem",
-        epistemic_scale: float = 0.0,
-        epistemic_mode: str = "logvar",
+        info_gain_weight: float = 0.0,
+        info_gain_mode: str = "ensemble_var",
         preference_mean=None,
         preference_std=None,
         preference_mode: str = "gaussian",
@@ -777,11 +786,11 @@ class LatentScalingAIFAgent(nn.Module):
         self.mc_num_trajectories = mc_num_trajectories  # J: trajectories per theta
         self.kl_theta_beta = kl_theta_beta
         self.policy_mode = policy_mode
-        self.epistemic_scale = float(epistemic_scale)
-        self.epistemic_mode = self._normalize_epistemic_mode(epistemic_mode)
+        self.info_gain_weight = float(info_gain_weight)
+        self.info_gain_mode = self._normalize_info_gain_mode(info_gain_mode)
         self.log_efe_terms = bool(log_efe_terms)
         self.deterministic = bool(deterministic)
-        self._warned_epistemic_unavailable = False
+        self._warned_info_gain_unavailable = False
         
         # Loss weights for world model training
         self.loss_weight_kl_state = float(loss_weight_kl_state)
@@ -822,7 +831,6 @@ class LatentScalingAIFAgent(nn.Module):
         self._mbrl_optimizer_name: Optional[str] = None
         self._mbrl_optimizer_horizon: Optional[int] = None
         self._mbrl_prev_solution = None
-        self._warned_mbrl_missing = False
 
         # Preferences: diagonal Gaussian or linear distance-based over observations.
         self.preference_mode = str(preference_mode).lower()
@@ -884,11 +892,19 @@ class LatentScalingAIFAgent(nn.Module):
         elif hasattr(self, "preference_mask"):
             del self.preference_mask
 
-    def _preference_risk(self, obs: torch.Tensor) -> torch.Tensor:
+    def _compute_neg_extrinsic_value(self, obs: torch.Tensor) -> torch.Tensor:
         """
-        Compute preference-based risk (negative reward). Supports two modes:
-        - "gaussian": Risk based on Gaussian log-likelihood with learned variance
-        - "linear": Risk based on L2 distance to goal with fixed scaling
+        Compute negative extrinsic value: -E[ln p(o|C)].
+
+        This is the negative log probability of observations under the preference
+        distribution. Higher values mean observations are further from preferences.
+
+        In the EFE formula: G = -extrinsic_value - info_gain
+        This function returns -extrinsic_value (i.e., the negative pragmatic value).
+
+        Supports two modes:
+        - "gaussian": Based on Gaussian log-likelihood with learned variance
+        - "linear": Based on L2 distance to goal with fixed scaling
         """
         delta = obs - self.preference_mean
         pref_mask = getattr(self, "preference_mask", None)
@@ -897,22 +913,22 @@ class LatentScalingAIFAgent(nn.Module):
             logvar_pref = self.preference_logvar * pref_mask
         else:
             logvar_pref = self.preference_logvar
-        
+
         # Linear distance-based preference
-        # This was just for testing, to make it equivalernt to the 
-        # "normal" distance-based reward. 
+        # This was just for testing, to make it equivalent to the
+        # "normal" distance-based reward.
         if self.preference_mode == "linear":
             # L2 distance scaled by preference_linear_scale
             distance = torch.norm(delta, p=2, dim=-1)
             return self.preference_linear_scale * distance
-        
+
         # Gaussian preference (default)
         var_pref = torch.exp(logvar_pref)
-        base_risk = (delta.pow(2) / var_pref).sum(dim=-1)
+        neg_extrinsic_base = (delta.pow(2) / var_pref).sum(dim=-1)
 
         weight = float(self.pref_target_weight)
         if weight <= 0.0:
-            return base_risk
+            return neg_extrinsic_base
         weight = min(max(weight, 0.0), 1.0 - 1e-6)
         scale = max(float(self.pref_target_scale), 1e-6)
         var_target = var_pref * (scale ** 2)
@@ -956,16 +972,17 @@ class LatentScalingAIFAgent(nn.Module):
         return aliases.get(key, key)
 
     @staticmethod
-    def _normalize_epistemic_mode(mode: Optional[str]) -> str:
-        mode = str(mode or "logvar").lower()
+    def _normalize_info_gain_mode(mode: Optional[str]) -> str:
+        mode = str(mode or "ensemble_var").lower()
         if mode not in ("logvar", "ensemble_var", "both"):
-            raise ValueError(f"Unknown epistemic_mode '{mode}'. Expected logvar, ensemble_var, or both.")
+            raise ValueError(f"Unknown info_gain_mode '{mode}'. Expected logvar, ensemble_var, or both.")
         return mode
 
-    def _use_ensemble_epistemic(self) -> bool:
-        if self.epistemic_scale <= 0.0:
+    def _use_ensemble_info_gain(self) -> bool:
+        """Check if ensemble disagreement should be used for info gain computation."""
+        if self.info_gain_weight <= 0.0:
             return False
-        if self.epistemic_mode not in ("ensemble_var", "both"):
+        if self.info_gain_mode not in ("ensemble_var", "both"):
             return False
         if isinstance(self.dynamics, PETSDynamicsModel):
             return int(getattr(self.dynamics, "ensemble_size", 1)) > 1
@@ -974,7 +991,8 @@ class LatentScalingAIFAgent(nn.Module):
         return False
 
     @staticmethod
-    def _ensemble_epistemic_from_mu_stack(mu_stack: torch.Tensor) -> torch.Tensor:
+    def _ensemble_disagreement_from_mu_stack(mu_stack: torch.Tensor) -> torch.Tensor:
+        """Compute ensemble disagreement (variance of means) as proxy for parameter info gain."""
         return mu_stack.var(dim=0, unbiased=False).mean(dim=-1)
 
     def _theta_mu_logvar_stack(self, s, a, num_models=None, theta_eps_list=None):
@@ -1388,49 +1406,86 @@ class LatentScalingAIFAgent(nn.Module):
         logvar_o: torch.Tensor,
         logvar_next: Optional[torch.Tensor] = None,
         return_terms: bool = False,
-        epistemic_override: Optional[torch.Tensor] = None,
+        ensemble_disagreement: Optional[torch.Tensor] = None,
+        mu_stack: Optional[torch.Tensor] = None,
+        logvar_stack: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute a single-step expected free energy proxy.
+        Compute expected free energy for action selection.
 
-        Risk (extrinsic value) is the (masked) distance between the predicted
-        observation and the preferred observation (goal), weighted by the
-        preference variance. Epistemic value is approximated by predictive
-        uncertainty over next states (and observations) and/or ensemble
-        disagreement, scaled by self.epistemic_scale. EFE is risk - epistemic.
+        -G = Extrinsic Value + State Info Gain + Parameter Info Gain
+
+        Where:
+        - Extrinsic Value = E_q(o|π)[ln p(o|C)]
+          Expected log probability of observations under preference distribution.
+
+        - State Info Gain = I(s; o | π) = H[q(o|π)] - E_q(s|π)[H[q(o|s,π)]]
+          Approximated by average aleatoric uncertainty from model predictions.
+
+        - Parameter Info Gain = I(θ; s | π) = H[q(s|π)] - E_q(θ)[H[q(s|π,θ)]]
+          Approximated by ensemble disagreement (variance of means across models).
+
+        Args:
+            ensemble_disagreement: Precomputed variance of means across ensemble/samples.
+            mu_stack: Stack of mean predictions from multiple models [K, B, dim].
+            logvar_stack: Stack of logvar predictions from multiple models [K, B, dim].
         """
-        # print("DEBUG Preference mean: ", self.preference_mean)
-        # print("DEBUG mu_o: ", mu_o)
-        # print("DEBUG delta: ", delta)
-        risk = self._preference_risk(mu_o)
+        # === Extrinsic Value: E_q(o|π)[ln p(o|C)] ===
+        # For Gaussian p(o|C) = N(C, σ²_C) and q(o|π) = N(μ_o, σ²_o):
+        # E[ln p(o|C)] = -0.5 * Σ_i [ ((μ_oi - Ci)² + σ²_oi) / σ²_Ci + ln(σ²_Ci) ]
+        delta = mu_o - self.preference_mean
+        pref_mask = getattr(self, "preference_mask", None)
+        if pref_mask is not None:
+            delta = delta * pref_mask
+            logvar_pref = self.preference_logvar * pref_mask
+            logvar_obs = logvar_o * pref_mask if logvar_o is not None else None
+        else:
+            logvar_pref = self.preference_logvar
+            logvar_obs = logvar_o
 
-        epistemic = torch.zeros_like(risk)
-        if self.epistemic_scale > 0.0:
-            epistemic_terms = []
-            use_logvar = self.epistemic_mode in ("logvar", "both")
-            use_ensemble = self.epistemic_mode in ("ensemble_var", "both")
+        var_pref = torch.exp(logvar_pref)
+        var_o = torch.exp(logvar_obs) if logvar_obs is not None else torch.zeros_like(var_pref)
 
-            def _add_logvar_terms():
-                if logvar_next is not None:
-                    epistemic_terms.append(torch.exp(logvar_next).mean(dim=-1))
-                if logvar_o is not None:
-                    epistemic_terms.append(torch.exp(logvar_o).mean(dim=-1))
+        # E[(o - C)²] = (μ_o - C)² + σ²_o
+        expected_sq_diff = delta.pow(2) + var_o
 
-            if use_logvar:
-                _add_logvar_terms()
-            if use_ensemble:
-                if epistemic_override is not None:
-                    epistemic_terms.append(epistemic_override)
-                elif not use_logvar:
-                    if not self._warned_epistemic_unavailable:
-                        print("[AIF][warn] ensemble epistemic requested but unavailable; falling back to logvar.")
-                        self._warned_epistemic_unavailable = True
-                    _add_logvar_terms()
-            if epistemic_terms:
-                epistemic = self.epistemic_scale * sum(epistemic_terms)
-        efe = risk - epistemic
+        # Extrinsic value = E[ln p(o|C)]
+        extrinsic_value = -0.5 * (expected_sq_diff / var_pref + logvar_pref).sum(dim=-1)
+
+        # === Information Gain Terms ===
+        state_info_gain = torch.zeros_like(extrinsic_value)
+        param_info_gain = torch.zeros_like(extrinsic_value)
+
+        if self.info_gain_weight > 0.0:
+            # Parameter Info Gain: I(θ; s | π) = H[q(s|π)] - E_q(θ)[H[q(s|π,θ)]]
+            # Approximated by ensemble disagreement (variance of means across models)
+            if ensemble_disagreement is not None:
+                # PETS ensemble: disagreement already computed
+                param_info_gain = self.info_gain_weight * ensemble_disagreement
+            elif mu_stack is not None:
+                # Bayesian model: compute from stacks
+                # Var[μ] across samples = parameter uncertainty
+                param_info_gain = self.info_gain_weight * mu_stack.var(dim=0, unbiased=False).mean(dim=-1)
+
+            # State Info Gain: I(s; o | π) = H[q(o|π)] - E_q(s|π)[H[q(o|s,π)]]
+            # Approximated by aleatoric uncertainty (average predictive variance)
+            if logvar_stack is not None:
+                # Average aleatoric uncertainty across ensemble/samples
+                # E_q(θ)[σ²] = mean of individual model variances
+                avg_aleatoric_var = torch.exp(logvar_stack).mean(dim=0).mean(dim=-1)
+                state_info_gain = self.info_gain_weight * avg_aleatoric_var
+            elif logvar_next is not None:
+                # Single model: use predictive variance as state uncertainty
+                state_info_gain = self.info_gain_weight * torch.exp(logvar_next).mean(dim=-1)
+
+        # -G = Extrinsic + State Info Gain + Parameter Info Gain
+        # G = -Extrinsic - State Info Gain - Parameter Info Gain
+        info_gain = state_info_gain + param_info_gain
+        efe = -extrinsic_value - info_gain
+
         if return_terms:
-            return efe, risk, epistemic
+            # Return: efe, negative extrinsic value, total info gain
+            return efe, -extrinsic_value, info_gain
         return efe
 
     def _policy_std_penalty(self) -> torch.Tensor:
@@ -1479,16 +1534,16 @@ class LatentScalingAIFAgent(nn.Module):
         efes = []
         log_probs = []
         discounts = torch.pow(self.gamma, torch.arange(rollout_horizon, device=self.device, dtype=torch.float32))
-        risk_terms = [] if self.log_efe_terms else None
-        epistemic_terms = [] if self.log_efe_terms else None
+        neg_extrinsic_terms = [] if self.log_efe_terms else None
+        info_gain_terms = [] if self.log_efe_terms else None
         policy_eps = self.policy_net.sample_eps()
         dynamics_eps = self.dynamics.sample_eps()
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
         num_models = max(1, int(self.mc_num_models or 1))
         theta_eps_list = None
         theta_model_idx = None
-        if use_bayes and use_ensemble_epistemic and num_models > 1:
+        if use_bayes and use_ensemble_info_gain and num_models > 1:
             theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
             theta_model_idx = random.randrange(num_models)
 
@@ -1499,13 +1554,15 @@ class LatentScalingAIFAgent(nn.Module):
             )
             log_probs.append(log_prob)
             with torch.no_grad():
-                ensemble_epistemic = None
-                if use_ensemble_epistemic:
+                ensemble_disagr = None
+                mu_stack = None
+                logvar_stack = None
+                if use_ensemble_info_gain:
                     mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
                         s, a, num_models=num_models, theta_eps_list=theta_eps_list
                     )
                     if mu_stack is not None:
-                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                         if use_bayes:
                             idx = theta_model_idx if theta_model_idx is not None else 0
                             mu_next = mu_stack[int(idx)]
@@ -1532,31 +1589,36 @@ class LatentScalingAIFAgent(nn.Module):
                 else:
                     mu_o, logvar_o = self.decoder(s)
             if self.log_efe_terms:
-                efe_t, risk_t, epistemic_t = self._expected_free_energy_step(
+                efe_t, neg_extrinsic_t, info_gain_t = self._expected_free_energy_step(
                     mu_o,
                     logvar_o,
                     logvar_next,
                     return_terms=True,
-                    epistemic_override=ensemble_epistemic,
+                    ensemble_disagreement=ensemble_disagr,
+                    mu_stack=mu_stack,
+                    logvar_stack=logvar_stack,
                 )
-                risk_terms.append(risk_t)
-                epistemic_terms.append(epistemic_t)
+                neg_extrinsic_terms.append(neg_extrinsic_t)
+                info_gain_terms.append(info_gain_t)
             else:
                 efe_t = self._expected_free_energy_step(
-                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                    mu_o, logvar_o, logvar_next,
+                    ensemble_disagreement=ensemble_disagr,
+                    mu_stack=mu_stack,
+                    logvar_stack=logvar_stack,
                 )
             efes.append(efe_t)
 
         efes = torch.stack(efes, dim=1)  # [B, H]
         log_probs = torch.stack(log_probs, dim=1)  # [B, H]
         discounted_efe = (efes * discounts.unsqueeze(0)).sum(dim=1)  # [B]
-        discounted_risk = None
-        discounted_epistemic = None
+        discounted_neg_extrinsic = None
+        discounted_info_gain = None
         if self.log_efe_terms:
-            risk_stack = torch.stack(risk_terms, dim=1)  # [B, H]
-            epistemic_stack = torch.stack(epistemic_terms, dim=1)  # [B, H]
-            discounted_risk = (risk_stack * discounts.unsqueeze(0)).sum(dim=1)
-            discounted_epistemic = (epistemic_stack * discounts.unsqueeze(0)).sum(dim=1)
+            neg_extrinsic_stack = torch.stack(neg_extrinsic_terms, dim=1)  # [B, H]
+            info_gain_stack = torch.stack(info_gain_terms, dim=1)  # [B, H]
+            discounted_neg_extrinsic = (neg_extrinsic_stack * discounts.unsqueeze(0)).sum(dim=1)
+            discounted_info_gain = (info_gain_stack * discounts.unsqueeze(0)).sum(dim=1)
 
         # REINFORCE-style objective to minimize expected free energy.
         adv = (discounted_efe - discounted_efe.mean()).detach()
@@ -1574,11 +1636,11 @@ class LatentScalingAIFAgent(nn.Module):
             "policy_imag_logprob": log_probs.sum(dim=1).mean().item(),
             "policy_std": self.policy_net.log_std.exp().mean().item(),
         }
-        if self.log_efe_terms and discounted_risk is not None and discounted_epistemic is not None:
+        if self.log_efe_terms and discounted_neg_extrinsic is not None and discounted_info_gain is not None:
             out.update(
                 {
-                    "policy_imag_risk": discounted_risk.mean().item(),
-                    "policy_imag_epistemic": discounted_epistemic.mean().item(),
+                    "policy_imag_neg_extrinsic": discounted_neg_extrinsic.mean().item(),
+                    "policy_imag_info_gain": discounted_info_gain.mean().item(),
                 }
             )
         return out
@@ -1646,9 +1708,10 @@ class LatentScalingAIFAgent(nn.Module):
     ):
         """
         Train policy_net on real transitions by minimizing expected free energy.
-        If next_obs_np is provided, compute the risk directly from the real next
-        observation (masked preference distance) instead of relying on model
-        predictions. Uses on-policy (latest) transition; off-policy replay is avoided.
+        If next_obs_np is provided, compute the negative extrinsic value directly
+        from the real next observation (masked preference distance) instead of
+        relying on model predictions. Uses on-policy (latest) transition; off-policy
+        replay is avoided.
 
         Args:
             compute_weight: Scaling factor for the policy update, proportional to planning
@@ -1663,7 +1726,7 @@ class LatentScalingAIFAgent(nn.Module):
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         actions = torch.as_tensor(action_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         policy_eps = self.policy_net.sample_eps()
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
         num_models = max(1, int(self.mc_num_models or 1))
         theta_eps_list = None
@@ -1675,20 +1738,32 @@ class LatentScalingAIFAgent(nn.Module):
                 mu, logvar = self.encoder(obs)
                 s = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
 
-        # Prefer real next observation for risk computation; fall back to model if absent.
+        # Prefer real next observation for EFE computation; fall back to model if absent.
+        # For real observations: no prediction uncertainty, so info_gain = 0.
         efe = None
-        risk = None
-        epistemic = torch.zeros(1, device=self.device)
+        neg_extrinsic = None
+        info_gain = torch.zeros(1, device=self.device)
         if next_obs_np is not None:
             with torch.no_grad():
                 obs_next = torch.as_tensor(next_obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-                risk = self._preference_risk(obs_next)
-                efe = risk  # epistemic is zero here
+                # Compute extrinsic value = E[ln p(o|C)] for real observation
+                # Since observation is known, no variance: E[(o-C)²] = (o-C)²
+                efe, neg_extrinsic, info_gain = self._expected_free_energy_step(
+                    obs_next,
+                    logvar_o=None,
+                    logvar_next=None,
+                    return_terms=True,
+                    ensemble_disagreement=None,
+                    mu_stack=None,
+                    logvar_stack=None,
+                )
         if efe is None:
             dynamics_eps = self.dynamics.sample_eps()
             with torch.no_grad():
-                ensemble_epistemic = None
-                if use_ensemble_epistemic:
+                ensemble_disagr = None
+                mu_stack = None
+                logvar_stack = None
+                if use_ensemble_info_gain:
                     if use_bayes and theta_eps_list is None and num_models > 1:
                         theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
                         theta_model_idx = random.randrange(num_models)
@@ -1696,7 +1771,7 @@ class LatentScalingAIFAgent(nn.Module):
                         s, actions, num_models=num_models, theta_eps_list=theta_eps_list
                     )
                     if mu_stack is not None:
-                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                         if use_bayes:
                             idx = theta_model_idx if theta_model_idx is not None else 0
                             mu_next = mu_stack[int(idx)]
@@ -1723,16 +1798,21 @@ class LatentScalingAIFAgent(nn.Module):
                 else:
                     mu_o, logvar_o = self.decoder(s_pred)
                 if self.log_efe_terms:
-                    efe, risk, epistemic = self._expected_free_energy_step(
+                    efe, neg_extrinsic, info_gain = self._expected_free_energy_step(
                         mu_o,
                         logvar_o,
                         logvar_next,
                         return_terms=True,
-                        epistemic_override=ensemble_epistemic,
+                        ensemble_disagreement=ensemble_disagr,
+                        mu_stack=mu_stack,
+                        logvar_stack=logvar_stack,
                     )
                 else:
                     efe = self._expected_free_energy_step(
-                        mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                        mu_o, logvar_o, logvar_next,
+                        ensemble_disagreement=ensemble_disagr,
+                        mu_stack=mu_stack,
+                        logvar_stack=logvar_stack,
                     )
 
         mean, std = self.policy_net(s, eps_cache=policy_eps)
@@ -1770,8 +1850,8 @@ class LatentScalingAIFAgent(nn.Module):
         if self.log_efe_terms:
             out.update(
                 {
-                    "policy_real_risk": risk.mean().item() if risk is not None else None,
-                    "policy_real_epistemic": epistemic.mean().item() if epistemic is not None else 0.0,
+                    "policy_real_neg_extrinsic": neg_extrinsic.mean().item() if neg_extrinsic is not None else None,
+                    "policy_real_info_gain": info_gain.mean().item() if info_gain is not None else 0.0,
                 }
             )
         return out
@@ -1785,7 +1865,7 @@ class LatentScalingAIFAgent(nn.Module):
 
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
         actions = torch.as_tensor(action_np, dtype=torch.float32, device=self.device).unsqueeze(0)
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
         num_models = max(1, int(self.mc_num_models or 1))
         theta_eps_list = None
@@ -1798,8 +1878,10 @@ class LatentScalingAIFAgent(nn.Module):
                 mu, logvar = self.encoder(obs)
                 s = mu + torch.exp(0.5 * logvar) * torch.randn_like(mu)
             dynamics_eps = self.dynamics.sample_eps()
-            ensemble_epistemic = None
-            if use_ensemble_epistemic:
+            ensemble_disagr = None
+            mu_stack = None
+            logvar_stack = None
+            if use_ensemble_info_gain:
                 if use_bayes and theta_eps_list is None and num_models > 1:
                     theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
                     theta_model_idx = random.randrange(num_models)
@@ -1807,7 +1889,7 @@ class LatentScalingAIFAgent(nn.Module):
                     s, actions, num_models=num_models, theta_eps_list=theta_eps_list
                 )
                 if mu_stack is not None:
-                    ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                    ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                     if use_bayes:
                         idx = theta_model_idx if theta_model_idx is not None else 0
                         mu_next = mu_stack[int(idx)]
@@ -1834,16 +1916,21 @@ class LatentScalingAIFAgent(nn.Module):
             else:
                 mu_o, logvar_o = self.decoder(s_pred)
             if self.log_efe_terms:
-                efe, risk, epistemic = self._expected_free_energy_step(
+                efe, neg_extrinsic, info_gain = self._expected_free_energy_step(
                     mu_o,
                     logvar_o,
                     logvar_next,
                     return_terms=True,
-                    epistemic_override=ensemble_epistemic,
+                    ensemble_disagreement=ensemble_disagr,
+                    mu_stack=mu_stack,
+                    logvar_stack=logvar_stack,
                 )
             else:
                 efe = self._expected_free_energy_step(
-                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                    mu_o, logvar_o, logvar_next,
+                    ensemble_disagreement=ensemble_disagr,
+                    mu_stack=mu_stack,
+                    logvar_stack=logvar_stack,
                 )
 
         out = {
@@ -1852,8 +1939,8 @@ class LatentScalingAIFAgent(nn.Module):
         if self.log_efe_terms:
             out.update(
                 {
-                    "policy_real_risk": risk.mean().item(),
-                    "policy_real_epistemic": epistemic.mean().item(),
+                    "policy_real_neg_extrinsic": neg_extrinsic.mean().item(),
+                    "policy_real_info_gain": info_gain.mean().item(),
                 }
             )
         return out
@@ -1955,16 +2042,7 @@ class LatentScalingAIFAgent(nn.Module):
     def _print_meta_selection(self, info: Optional[Dict[str, Any]]) -> None:
         if not info:
             return
-        horizon = info.get("meta_plan_horizon", 0)
-        candidates = info.get("meta_plan_candidates", 0)
-        mc_models = info.get("meta_mc_models", 0)
-        mc_traj = info.get("meta_mc_trajectories", 0)
-        rollouts = info.get("meta_action_rollouts", 0)
-        deterministic = bool(info.get("meta_deterministic", False))
-        print(
-            f"[AIF][meta] H={horizon} N={candidates} M={mc_models} "
-            f"T={mc_traj} R={rollouts} det={deterministic}"
-        )
+        # Meta planning params are logged by MetaPlanningController.select_mode
 
     def plan_action(self, obs_np, plan_override: Optional[Dict[str, Any]] = None):
         """
@@ -2024,21 +2102,15 @@ class LatentScalingAIFAgent(nn.Module):
                         a0, best_score, logprob0 = self._plan_action_with_policy_net_sampling(s0)
                         self._cached_policy_score = best_score
                         self._last_action_logprob = logprob0
-                    else:
+                    elif mode in ("cem", "icem"):
                         with torch.no_grad():
-                            if mode in ("cem", "icem"):
-                                a0 = self._plan_action_with_mbrl_optimizer(s0, mode)
-                                self._cached_policy_score = self._last_plan_score_best
-                                self._last_action_logprob = None
-                            elif mode == "simple_cem":
-                                a0 = self._plan_action_with_simple_cem(s0)
-                                self._cached_policy_score = None
-                                self._last_action_logprob = None
-                            else:
-                                a0 = self._plan_action_with_simple_cem(s0)
-                                self._cached_policy_score = None
-                                self._last_action_logprob = None
-
+                            a0 = self._plan_action_with_mbrl_optimizer(s0, mode)
+                            self._cached_policy_score = self._last_plan_score_best
+                            self._last_action_logprob = None
+                    else:
+                        raise ValueError(
+                            f"Unknown policy_mode '{mode}'. Expected 'policy_net', 'cem', or 'icem'."
+                        )
 
                 # Train policy to imitate the planned best action (behavioral cloning from planner)
                 # Compute weight proportional to planning complexity (normalized)
@@ -2062,44 +2134,6 @@ class LatentScalingAIFAgent(nn.Module):
             self._policy_replan_counter = 1
 
         return a0.detach().cpu().numpy()
-
-    def _plan_action_with_simple_cem(self, s0: torch.Tensor) -> torch.Tensor:
-        """Original lightweight CEM loop (kept for backward compatibility)."""
-        mu = torch.zeros(self.cem_horizon, self.action_dim, device=self.device)
-        sigma = torch.ones_like(mu) * 0.5
-
-        scores = None
-        with torch.no_grad():
-            for _ in range(self.cem_num_iters):
-                eps = torch.randn(self.cem_num_samples, self.cem_horizon, self.action_dim, device=self.device)
-                actions = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps  # [N, H, A]
-                actions = torch.clamp(actions, self.action_low, self.action_high)
-
-                scores = []
-                for n in range(self.cem_num_samples):
-                    seq = actions[n]  # [H, A]
-                    score = self._evaluate_action_sequence(s0, seq)
-                    scores.append(score)
-                scores = torch.stack(scores)  # [N]
-
-                elite_indices = scores.topk(self.cem_num_elites, dim=0, largest=False).indices
-                elite_actions = actions[elite_indices]  # [M, H, A]
-
-                mu = elite_actions.mean(dim=0)
-                sigma = elite_actions.std(dim=0, unbiased=False) + 1e-6
-
-            if scores is not None and scores.numel() > 0:
-                self._last_plan_score_best = float(scores.min().item())
-                self._last_plan_score_worst = float(scores.max().item())
-            else:
-                self._last_plan_score_best = None
-                self._last_plan_score_worst = None
-
-            mu = torch.clamp(mu, self.action_low, self.action_high)
-            self._last_plan_sequence = mu.detach()
-            a0 = mu[0]
-            a0 = torch.clamp(a0, self.action_low, self.action_high)
-            return a0
 
     def _reshape_action_sequences(
         self, actions: torch.Tensor, horizon: int, action_dim: int
@@ -2166,10 +2200,10 @@ class LatentScalingAIFAgent(nn.Module):
         num_traj = max(1, int(self.mc_num_trajectories or 1))
         num_particles = num_models * num_traj
         deterministic_rollout = bool(self.deterministic)
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
         use_pets = isinstance(self.dynamics, PETSDynamicsModel)
-        if deterministic_rollout and not use_ensemble_epistemic:
+        if deterministic_rollout and not use_ensemble_info_gain:
             num_particles = 1
 
         s = s0.view(1, 1, -1).expand(num_particles, num_sequences, -1)
@@ -2235,15 +2269,16 @@ class LatentScalingAIFAgent(nn.Module):
                 a_t = actions[:, :, t, :]
                 s_flat = s.reshape(num_particles * num_sequences, -1)
                 a_flat = a_t.reshape(num_particles * num_sequences, -1)
-                ensemble_epistemic = None
+                ensemble_disagr = None
+                mu_stack = None
+                logvar_stack = None
                 if use_bayes and num_models > 1:
-                    mu_stack = logvar_stack = None
                     if theta_eps_list_local is not None:
                         mu_stack, logvar_stack, theta_eps_list_local = self._theta_mu_logvar_stack(
                             s_flat, a_flat, num_models=num_models, theta_eps_list=theta_eps_list_local
                         )
-                    if mu_stack is not None and use_ensemble_epistemic:
-                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                    if mu_stack is not None and use_ensemble_info_gain:
+                        ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                     if mu_stack is not None:
                         if model_indices is None:
                             mu_next = mu_stack.mean(dim=0)
@@ -2262,10 +2297,10 @@ class LatentScalingAIFAgent(nn.Module):
                             deterministic_plan=deterministic_rollout,
                             dyn_eps_cache=dyn_eps_cache,
                         )
-                elif use_ensemble_epistemic and use_pets:
+                elif use_ensemble_info_gain and use_pets:
                     mu_stack, logvar_stack, _ = self._theta_mu_logvar_stack(s_flat, a_flat)
                     if mu_stack is not None:
-                        ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                        ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                         if deterministic_rollout:
                             mu_next = mu_stack.mean(dim=0)
                             logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
@@ -2313,7 +2348,10 @@ class LatentScalingAIFAgent(nn.Module):
                     mu_o, logvar_o = self.decoder(s_flat)
 
                 efe_t = self._expected_free_energy_step(
-                    mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                    mu_o, logvar_o, logvar_next,
+                    ensemble_disagreement=ensemble_disagr,
+                    mu_stack=mu_stack,
+                    logvar_stack=logvar_stack,
                 )
                 total_efe += discounts[t] * efe_t.view(num_particles, num_sequences)
                 s = s_flat.view(num_particles, num_sequences, -1)
@@ -2435,22 +2473,21 @@ class LatentScalingAIFAgent(nn.Module):
 
     def _plan_action_with_mbrl_optimizer(self, s0: torch.Tensor, optimizer_name: str) -> torch.Tensor:
         if mbrl_planning is None:
-            if not self._warned_mbrl_missing:
-                print("[AIF] mbrl not installed; falling back to simple CEM.")
-                self._warned_mbrl_missing = True
-            return self._plan_action_with_simple_cem(s0)
+            raise RuntimeError(
+                "mbrl not installed; set aif_policy_mode='policy_net' or install mbrl to use CEM/ICEM."
+            )
         horizon = int(self.cem_horizon)
         optimizer = self._get_mbrl_optimizer(optimizer_name, horizon)
         if optimizer is None:
-            return self._plan_action_with_simple_cem(s0)
+            raise RuntimeError(f"mbrl optimizer '{optimizer_name}' is unavailable.")
         all_scores_during_optimization = []  # Track scores from all iterations
         call_count = [0]  # Track how many times objective_fn is called
         deterministic_plan = bool(self.deterministic)
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         num_models = max(1, int(self.mc_num_models or 1))
         num_traj = max(1, int(self.mc_num_trajectories or 1))
         num_particles = num_models * num_traj
-        if deterministic_plan and not use_ensemble_epistemic:
+        if deterministic_plan and not use_ensemble_info_gain:
             num_particles = 1
         theta_eps_list = None
         theta_eps_cache = None
@@ -2460,7 +2497,7 @@ class LatentScalingAIFAgent(nn.Module):
                 theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
             else:
                 theta_eps_cache = self.dynamics.sample_eps()
-        if cached_model_indices is None and not (deterministic_plan and not use_ensemble_epistemic):
+        if cached_model_indices is None and not (deterministic_plan and not use_ensemble_info_gain):
             if isinstance(self.dynamics, PETSDynamicsModel):
                 ensemble_size = max(1, int(getattr(self.dynamics, "ensemble_size", 1)))
                 if num_particles > 1:
@@ -2535,7 +2572,7 @@ class LatentScalingAIFAgent(nn.Module):
             print(f"[DEBUG] Exception in _mbrl_optimize: {type(e).__name__}: {e}")
             import traceback
             traceback.print_exc()
-            return self._plan_action_with_simple_cem(s0)
+            raise
 
         # result is a torch.Tensor of shape [H, A] or flat [H*A]
         if isinstance(result, torch.Tensor):
@@ -2544,7 +2581,7 @@ class LatentScalingAIFAgent(nn.Module):
             solution = result[0] if isinstance(result, (tuple, list)) else result
         
         if solution is None:
-            return self._plan_action_with_simple_cem(s0)
+            raise RuntimeError("mbrl optimizer returned no solution.")
         
         # Ensure solution is a tensor on the correct device
         if not isinstance(solution, torch.Tensor):
@@ -2614,7 +2651,7 @@ class LatentScalingAIFAgent(nn.Module):
         last_scores_t: Optional[torch.Tensor] = None
         action_rollouts = max(1, int(self.policy_plan_action_rollouts))
         deterministic_plan = bool(self.deterministic)
-        use_ensemble_epistemic = self._use_ensemble_epistemic()
+        use_ensemble_info_gain = self._use_ensemble_info_gain()
         use_bayes = isinstance(self.dynamics, BayesianDynamicsModel)
         num_models = max(1, int(self.mc_num_models or 1))
 
@@ -2638,7 +2675,7 @@ class LatentScalingAIFAgent(nn.Module):
                     dynamics_eps = None if deterministic_plan else self.dynamics.sample_eps()
                     theta_eps_list = None
                     theta_model_idx = None
-                    if use_bayes and use_ensemble_epistemic and num_models > 1:
+                    if use_bayes and use_ensemble_info_gain and num_models > 1:
                         theta_eps_list = [self.dynamics.sample_eps() for _ in range(num_models)]
                         theta_model_idx = random.randrange(num_models)
 
@@ -2652,13 +2689,15 @@ class LatentScalingAIFAgent(nn.Module):
                             actions.append(action.squeeze(0).detach())
 
                         with torch.no_grad():
-                            ensemble_epistemic = None
-                            if use_ensemble_epistemic:
+                            ensemble_disagr = None
+                            mu_stack = None
+                            logvar_stack = None
+                            if use_ensemble_info_gain:
                                 mu_stack, logvar_stack, theta_eps_list = self._theta_mu_logvar_stack(
                                     s_roll, action, num_models=num_models, theta_eps_list=theta_eps_list
                                 )
                                 if mu_stack is not None:
-                                    ensemble_epistemic = self._ensemble_epistemic_from_mu_stack(mu_stack)
+                                    ensemble_disagr = self._ensemble_disagreement_from_mu_stack(mu_stack)
                                     if deterministic_plan:
                                         mu_next = mu_stack.mean(dim=0)
                                         logvar_next = logvar_stack.mean(dim=0) if logvar_stack is not None else None
@@ -2700,7 +2739,10 @@ class LatentScalingAIFAgent(nn.Module):
                             else:
                                 mu_o, logvar_o = self.decoder(s_roll)
                             efe_t = self._expected_free_energy_step(
-                                mu_o, logvar_o, logvar_next, epistemic_override=ensemble_epistemic
+                                mu_o, logvar_o, logvar_next,
+                                ensemble_disagreement=ensemble_disagr,
+                                mu_stack=mu_stack,
+                                logvar_stack=logvar_stack,
                             )
                             traj_efe = traj_efe + discount * efe_t
                             discount = discount * self.gamma
@@ -2823,6 +2865,11 @@ class LatentScalingAIFAgent(nn.Module):
         self._meta_step_counter = 0
         self._meta_needs_recompute = True
 
+        # Reset meta controller's episode-specific tracking to prevent cross-episode contamination
+        if self._meta_controller is not None:
+            self._meta_controller._meta_period_initial_obs = None
+            self._meta_controller._meta_period_steps = 0
+
     def update_meta_stats(self, obs_np: np.ndarray, action_np: np.ndarray, next_obs_np: np.ndarray) -> None:
         if self._meta_controller is None or not getattr(self._meta_controller, "enabled", False):
             return
@@ -2836,7 +2883,7 @@ class LatentScalingAIFAgent(nn.Module):
 
 class ActiveInferenceSB3:
     """
-    Lightweight SB3-compatible wrapper around LatentScalingAIFAgent.
+    Lightweight SB3-compatible wrapper around AIFAgent.
     Provides learn/predict/save/load so it plugs into train.py/test.py.
     """
 
@@ -2861,8 +2908,8 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_policy_updates_per_step", 1)
         self.arg_dict.setdefault("aif_replay_size", 100000)
         self.arg_dict.setdefault("aif_gamma", 0.99)
-        self.arg_dict.setdefault("aif_epistemic_scale", 0.0)
-        self.arg_dict.setdefault("aif_epistemic_mode", "logvar")
+        self.arg_dict.setdefault("aif_info_gain_weight", 0.0)
+        self.arg_dict.setdefault("aif_info_gain_mode", "ensemble_var")
         self.arg_dict.setdefault("aif_pref_mean", None)
         self.arg_dict.setdefault("aif_pref_std", None)
         self.arg_dict.setdefault("aif_pref_target_weight", 0.0)
@@ -2874,7 +2921,7 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_plan_elites", 6)
         self.arg_dict.setdefault("aif_mc_models", None)
         self.arg_dict.setdefault("aif_kl_theta_beta", 1.0)
-        self.arg_dict.setdefault("aif_policy_mode", "cem")  # options: "cem", "icem", "policy_net", "simple_cem"
+        self.arg_dict.setdefault("aif_policy_mode", "cem")  # options: "cem", "icem", "policy_net"
         self.arg_dict.setdefault("aif_policy_eval_mode", "plan")  # options: "plan", "mean" (policy_net only)
         self.arg_dict.setdefault("aif_policy_imagination_freq", 0)  # 0 disables
         self.arg_dict.setdefault("aif_policy_imagination_horizon", None)
@@ -2910,17 +2957,13 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_meta_max_modes", None)
         self.arg_dict.setdefault("aif_meta_recompute_freq", 1)
         self.arg_dict.setdefault("aif_meta_cost_log", True)
-        self.arg_dict.setdefault("aif_meta_cost_weight", 1.0)
-        self.arg_dict.setdefault("aif_meta_habit_weight", 1.0)
+        self.arg_dict.setdefault("aif_meta_policy_ambiguity_weight", 1.0)
         self.arg_dict.setdefault("aif_meta_model_ambiguity_weight", 1.0)
-        self.arg_dict.setdefault("aif_meta_w_success", 1.0)
-        self.arg_dict.setdefault("aif_meta_p_pref_success", 0.9)
-        self.arg_dict.setdefault("aif_meta_w_epistemic", 1.0)
-        self.arg_dict.setdefault("aif_meta_gate_reliability_threshold", 0.3)
-        self.arg_dict.setdefault("aif_meta_gate_k", 10.0)
-        self.arg_dict.setdefault("aif_meta_gate_theta_threshold", None)
-        self.arg_dict.setdefault("aif_meta_gate_k2", 10.0)
-        self.arg_dict.setdefault("aif_meta_planning_load_ambiguity_scale", 0.1)
+        # Observation preference precisions
+        self.arg_dict.setdefault("aif_meta_pref_extrinsic_precision", 1.0)
+        self.arg_dict.setdefault("aif_meta_pref_policy_uncert_precision", 1.0)
+        self.arg_dict.setdefault("aif_meta_pref_model_uncert_precision", 1.0)
+        self.arg_dict.setdefault("aif_meta_pref_effort_precision", 1.0)
         self.arg_dict.setdefault("aif_meta_error_ema_beta", 0.9)
         self.arg_dict.setdefault("aif_meta_uncert_ema_beta", 0.9)
         self.arg_dict.setdefault("aif_meta_policy_uncert_ema_beta", 0.9)
@@ -2997,7 +3040,7 @@ class ActiveInferenceSB3:
             world_model_type = raw_world_model.get("type") or raw_world_model.get("model") or raw_world_model.get("name")
         if "aif_world_model_type" in self.arg_dict:
             world_model_type = self.arg_dict.get("aif_world_model_type")
-        world_model_type = LatentScalingAIFAgent._normalize_world_model_type(world_model_type)
+        world_model_type = AIFAgent._normalize_world_model_type(world_model_type)
         hidden_dim = world_model_cfg.get("hid_size", 128)
         ensemble_size = world_model_cfg.get("ensemble_size", 5)
         dynamics_num_layers = int(world_model_cfg.get("num_layers", 3))
@@ -3041,17 +3084,13 @@ class ActiveInferenceSB3:
             "mc_trajectories_step": self.arg_dict.get("aif_meta_mc_trajectories_step", 1),
             "action_rollouts_step": self.arg_dict.get("aif_meta_action_rollouts_step", 1),
             "cost_log": bool(self.arg_dict.get("aif_meta_cost_log", True)),
-            "cost_weight": self.arg_dict.get("aif_meta_cost_weight", 1.0),
-            "habit_weight": self.arg_dict.get("aif_meta_habit_weight", 1.0),
+            "policy_ambiguity_weight": self.arg_dict.get("aif_meta_policy_ambiguity_weight", 1.0),
             "model_ambiguity_weight": self.arg_dict.get("aif_meta_model_ambiguity_weight", 1.0),
-            "meta_w_success": self.arg_dict.get("aif_meta_w_success", 1.0),
-            "meta_p_pref_success": self.arg_dict.get("aif_meta_p_pref_success", 0.9),
-            "meta_w_epistemic": self.arg_dict.get("aif_meta_w_epistemic", 1.0),
-            "meta_gate_reliability_threshold": self.arg_dict.get("aif_meta_gate_reliability_threshold", 0.3),
-            "meta_gate_k": self.arg_dict.get("aif_meta_gate_k", 10.0),
-            "meta_gate_theta_threshold": self.arg_dict.get("aif_meta_gate_theta_threshold"),
-            "meta_gate_k2": self.arg_dict.get("aif_meta_gate_k2", 10.0),
-            "planning_load_ambiguity_scale": self.arg_dict.get("aif_meta_planning_load_ambiguity_scale", 0.1),
+            # Observation preference precisions
+            "pref_extrinsic_precision": self.arg_dict.get("aif_meta_pref_extrinsic_precision", 1.0),
+            "pref_policy_uncert_precision": self.arg_dict.get("aif_meta_pref_policy_uncert_precision", 1.0),
+            "pref_model_uncert_precision": self.arg_dict.get("aif_meta_pref_model_uncert_precision", 1.0),
+            "pref_effort_precision": self.arg_dict.get("aif_meta_pref_effort_precision", 1.0),
             "error_ema_beta": self.arg_dict.get("aif_meta_error_ema_beta", 0.9),
             "uncert_ema_beta": self.arg_dict.get("aif_meta_uncert_ema_beta", 0.9),
             "policy_uncert_ema_beta": self.arg_dict.get("aif_meta_policy_uncert_ema_beta", 0.9),
@@ -3067,7 +3106,6 @@ class ActiveInferenceSB3:
             "initial_model_error": self.arg_dict.get("aif_meta_initial_model_error", 2.0),
             "initial_model_uncert": self.arg_dict.get("aif_meta_initial_model_uncert", 1.0),
             "initial_policy_uncert": self.arg_dict.get("aif_meta_initial_policy_uncert", 1.0),
-            "initial_risk": self.arg_dict.get("aif_meta_initial_risk", 1.0),
         }
 
         obs_dim = self._infer_obs_dim(self.observation_space)
@@ -3086,7 +3124,7 @@ class ActiveInferenceSB3:
         self.arg_dict["aif_world_model_type"] = world_model_type
         latent_dim = obs_dim if fully_observable_mdp else self.arg_dict.get("aif_latent_dim")
 
-        self.agent = LatentScalingAIFAgent(
+        self.agent = AIFAgent(
             obs_dim=obs_dim,
             action_dim=action_dim,
             action_low=self.action_space.low,
@@ -3103,8 +3141,8 @@ class ActiveInferenceSB3:
             mc_num_trajectories=mc_traj,
             kl_theta_beta=self.arg_dict.get("aif_kl_theta_beta", 1.0),
             policy_mode=str(self.arg_dict.get("aif_policy_mode", "cem")).lower(),
-            epistemic_scale=self.arg_dict.get("aif_epistemic_scale", 0.0),
-            epistemic_mode=self.arg_dict.get("aif_epistemic_mode", "logvar"),
+            info_gain_weight=self.arg_dict.get("aif_info_gain_weight", 0.0),
+            info_gain_mode=self.arg_dict.get("aif_info_gain_mode", "ensemble_var"),
             preference_mean=self.arg_dict.get("aif_pref_mean"),
             preference_std=self.arg_dict.get("aif_pref_std"),
             preference_mode=self.arg_dict.get("aif_preference_mode", "gaussian"),
@@ -3460,6 +3498,56 @@ class ActiveInferenceSB3:
             reset_fn()
         return obs
 
+    def _update_final_extrinsic_value(self, final_obs_np: np.ndarray) -> None:
+        """Update extrinsic value EMA with terminal observation before episode reset.
+
+        This ensures successful episodes (which may end before the next meta recompute)
+        contribute their improvement signal to the EMA.
+        """
+        meta_ctrl = getattr(self.agent, "_meta_controller", None)
+        if meta_ctrl is None or not getattr(meta_ctrl, "enabled", False):
+            return
+        if meta_ctrl._meta_period_initial_obs is None or meta_ctrl._meta_period_steps <= 0:
+            return
+
+        try:
+            initial_obs_t = torch.as_tensor(
+                meta_ctrl._meta_period_initial_obs,
+                dtype=torch.float32,
+                device=self.agent.device
+            ).unsqueeze(0)
+            final_obs_t = torch.as_tensor(
+                final_obs_np,
+                dtype=torch.float32,
+                device=self.agent.device
+            ).unsqueeze(0)
+
+            with torch.no_grad():
+                initial_neg_extrinsic = self.agent._compute_neg_extrinsic_value(initial_obs_t).mean().item()
+                final_neg_extrinsic = self.agent._compute_neg_extrinsic_value(final_obs_t).mean().item()
+
+            # Improvement = reduction in neg_extrinsic (initial - final), per step
+
+            # Normalized:
+            # this is equivalent per_step_extrinsic / max_possible_per_step
+            improvement = (initial_neg_extrinsic - final_neg_extrinsic) / initial_neg_extrinsic if abs(initial_neg_extrinsic) > 0 else 0.0
+            steps = meta_ctrl._meta_period_steps
+
+            # Update EMA
+            beta = meta_ctrl.extrinsic_value_ema_beta
+            meta_ctrl.extrinsic_value_ema = beta * meta_ctrl.extrinsic_value_ema + (1 - beta) * improvement
+
+            print(f"[META][extrinsic] terminal: initial_neg={initial_neg_extrinsic:.4f} "
+                  f"final_neg={final_neg_extrinsic:.4f} steps={steps} "
+                  f"improvement={improvement:.6f} ema={meta_ctrl.extrinsic_value_ema:.6f}")
+
+            # Reset tracking (will also be done in reset_planner_state, but be explicit)
+            meta_ctrl._meta_period_initial_obs = None
+            meta_ctrl._meta_period_steps = 0
+
+        except Exception:
+            pass  # Fail silently if computation fails
+
     @staticmethod
     def _unpack_step(step_out):
         if len(step_out) == 5:
@@ -3635,6 +3723,7 @@ class ActiveInferenceSB3:
                             model_loss = last_info.get("mse", last_info.get("nll_obs"))
                         if model_loss is not None:
                             print(f"[AIF] dynamics_model_loss: {float(model_loss):.6f}")
+                            log_info["dynamics_train_loss"] = float(model_loss)
                     if not self._model_update_debug_printed:
                         print(
                             f"[AIF][debug] world-model update at step {self.num_timesteps} (grad_steps={model_updates})"
@@ -3705,10 +3794,6 @@ class ActiveInferenceSB3:
             current_meta_info = getattr(self.agent, "_last_meta_info", None)
             is_deterministic_mode = bool(current_meta_info.get("meta_deterministic", False)) if current_meta_info else False
 
-            # Debug: log when skipping policy learning due to deterministic mode
-            if is_deterministic_mode and self.num_timesteps % 500 == 0:
-                print(f"[AIF] step {self.num_timesteps}: Skipping policy learning (deterministic mode)")
-
             # Optional imagined rollouts to train policy_net
             pol_freq = int(self.arg_dict.get("aif_policy_imagination_freq", 0) or 0)
             pol_updates = int(self.arg_dict.get("aif_policy_imagination_updates", 1) or 1)
@@ -3776,7 +3861,7 @@ class ActiveInferenceSB3:
                     log_info["model_error_ema"] = float(meta_ctrl.model_error_ema)
                     log_info["model_uncert_ema"] = float(meta_ctrl.model_uncert_ema)
                     log_info["policy_uncert_ema"] = float(meta_ctrl.policy_uncert_ema)
-                    # Note: Task-level risk_ema removed. Meta-risk is now pre-computed per mode.
+                    # Meta-risk is pre-computed per mode.
                 if log_info:
                     tb_metrics = {f"aif/{k}": v for k, v in log_info.items()}
                     self._log_tb_metrics(tb_metrics, self.num_timesteps)
@@ -3797,6 +3882,11 @@ class ActiveInferenceSB3:
                 if not keep_training:
                     break
 
+            # Update extrinsic value EMA with terminal observation before episode reset
+            # This ensures successful episodes contribute their improvement signal
+            if done:
+                self._update_final_extrinsic_value(flat_next_obs)
+
             obs = self._reset_env() if done else next_obs
             episode_step += 1
             self._update_episode_pbar(episode_step)
@@ -3808,8 +3898,8 @@ class ActiveInferenceSB3:
                     ee_arr = None
                 if ee_arr is not None and ee_arr.size >= 3:
                     print(f"[AIF] episode {episode_idx} end effector final position: {ee_arr[:3]}")
-                # Risk evaluated on the real observation (no model prediction)
-                risk_real_obs = None
+                # Negative extrinsic value (distance to preferences) on real observation
+                neg_extrinsic_real = None
                 try:
                     pref_mean = getattr(self.agent, "preference_mean", None)
                     pref_logvar = getattr(self.agent, "preference_logvar", None)
@@ -3818,11 +3908,12 @@ class ActiveInferenceSB3:
                             obs_t = torch.as_tensor(
                                 flat_next_obs, dtype=torch.float32, device=self.agent.device
                             ).unsqueeze(0)
-                            risk_real_obs = self.agent._preference_risk(obs_t).mean().item()
+                            # Compute -E[ln p(o|C)] = negative extrinsic value
+                            neg_extrinsic_real = self.agent._compute_neg_extrinsic_value(obs_t).mean().item()
                 except Exception:
-                    risk_real_obs = None
-                if risk_real_obs is not None:
-                    print(f"[AIF] episode {episode_idx} real_obs_risk: {risk_real_obs:.4f}")
+                    neg_extrinsic_real = None
+                if neg_extrinsic_real is not None:
+                    print(f"[AIF] episode {episode_idx} real_obs_neg_extrinsic: {neg_extrinsic_real:.4f}")
                 # Planner score extrema from last planning call
                 best_score = getattr(self.agent, "_last_plan_score_best", None)
                 worst_score = getattr(self.agent, "_last_plan_score_worst", None)
@@ -3845,8 +3936,6 @@ class ActiveInferenceSB3:
         if pref_vec is not None:
             self.agent.set_preference_mean(pref_vec, pref_mask)
         eval_mode = self._policy_eval_mode
-        if deterministic:
-            eval_mode = "mean"
         policy_mode = str(self.arg_dict.get("aif_policy_mode", "cem")).lower()
         if eval_mode == "mean" and policy_mode == "policy_net":
             action = self.agent.policy_net_mean_action(obs_vec)
