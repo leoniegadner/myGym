@@ -6,8 +6,8 @@ import math
 from myGym.utils.helpers import get_robot_dict, get_gripper_dict
 import os
 
-currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
-repodir = pkg_resources.files("myGym")
+currentdir = str(pkg_resources.files("myGym") / "envs")
+repodir = str(pkg_resources.files("myGym"))
 
 
 class Robot:
@@ -118,17 +118,17 @@ class Robot:
         """
         root = pkg_resources.files("myGym")
         rel = self.robot_path.lstrip("/\\")        # strip leading / or \
-        full = os.path.join(root, rel)
+        full = str(root / rel)
         if self.robot_path[-3:] == 'sdf':
             objects = self.p.loadSDF(
-               os.path.join(pkg_resources.files("myGym"), self.robot_path))
+               str(pkg_resources.files("myGym") / self.robot_path))
             self.robot_uid = objects[0]
             self.p.resetBasePositionAndOrientation(self.robot_uid, self.position,
                                               self.orientation)
         else:
 
             self.robot_uid = self.p.loadURDF(
-                os.path.join(pkg_resources.files("myGym"), self.robot_path),
+                str(pkg_resources.files("myGym") / self.robot_path),
                 self.position, self.orientation, useFixedBase=True, flags=(self.p.URDF_USE_SELF_COLLISION))
         for jid in range(self.p.getNumJoints(self.robot_uid)):
                 self.p.changeDynamics(self.robot_uid, jid,  collisionMargin=0., contactProcessingThreshold=0.0, ccdSweptSphereRadius=0)

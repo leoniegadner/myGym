@@ -219,7 +219,7 @@ if __name__ == "__main__":
                         help='vae config')
     args = parser.parse_args()
     config = ConfigParser()
-    config.read(os.path.join(pkg_resources.files("myGym"), '/vae/{}'.format(args.config)))
+    config.read(str(pkg_resources.files("myGym") / 'vae' / args.config))
 
     with open(os.path.join(SAVE_DIR,'config.ini'), 'w') as f:
          config.write(f)

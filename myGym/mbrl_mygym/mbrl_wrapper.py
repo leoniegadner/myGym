@@ -510,10 +510,42 @@ class MBRLWrapper:
                     self.model = model
 
                 def reset(self, *args, **kwargs):
-                    return self.env.reset(*args, **kwargs)
+                    import numpy as np
+                    # DummyVecEnv doesn't accept 'seed' kwarg, so remove it
+                    kwargs.pop('seed', None)
+                    result = self.env.reset(*args, **kwargs)
+                    # DummyVecEnv.reset() returns only obs, but MBRL expects (obs, info)
+                    if isinstance(result, tuple):
+                        obs, info = result
+                    else:
+                        obs, info = result, {}
+                    # DummyVecEnv returns obs with shape (n_envs, obs_dim), squeeze for single env
+                    if isinstance(obs, np.ndarray) and obs.ndim > 1 and obs.shape[0] == 1:
+                        obs = obs.squeeze(0)
+                    return obs, info
 
                 def step(self, action):
-                    obs, reward, terminated, truncated, info = self.env.step(action)
+                    import numpy as np
+                    # DummyVecEnv expects actions with shape (n_envs, action_dim)
+                    # MBRL may pass (action_dim,), so reshape if needed
+                    action = np.atleast_2d(action)
+                    result = self.env.step(action)
+                    # Handle both old Gym API (4 values) and new Gymnasium API (5 values)
+                    if len(result) == 4:
+                        obs, reward, done, info = result
+                        terminated = done
+                        truncated = np.zeros_like(done, dtype=bool) if hasattr(done, '__len__') else False
+                    else:
+                        obs, reward, terminated, truncated, info = result
+                    # DummyVecEnv returns arrays with shape (n_envs, ...), squeeze for single env
+                    if isinstance(obs, np.ndarray) and obs.ndim > 1 and obs.shape[0] == 1:
+                        obs = obs.squeeze(0)
+                    if isinstance(reward, np.ndarray) and reward.shape == (1,):
+                        reward = reward[0]
+                    if isinstance(terminated, np.ndarray) and terminated.shape == (1,):
+                        terminated = terminated[0]
+                    if isinstance(truncated, np.ndarray) and truncated.shape == (1,):
+                        truncated = truncated[0]
                     # Keep SB3 counters in sync
                     self.model.num_timesteps += 1
                     if hasattr(self.cb, "num_timesteps"):

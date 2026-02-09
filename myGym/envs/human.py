@@ -56,7 +56,7 @@ class Human:
             :param model_name: (string) Model name in the get_robot_dict() dictionary
         """
         path, position, orientation = get_robot_dict()[model_name].values()
-        path = os.path.join(pkg_resources.files("myGym"), path)
+        path = str(pkg_resources.files("myGym") / path)
         orientation = self.p.getQuaternionFromEuler(orientation)
 
         if path[-3:] == 'sdf':

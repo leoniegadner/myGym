@@ -630,7 +630,7 @@ def test_robot_reachability(robot_key, r_dict, args):
     p.setGravity(0, 0, -9.81)
     
     # Load scene similar to _setup_scene in gym_env
-    currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
+    currentdir = str(pkg_resources.files("myGym") / "envs")
     
     
     

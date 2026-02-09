@@ -8,10 +8,10 @@ import numpy as np
 import cv2
 import random
 import importlib.resources as pkg_resources
-currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
+currentdir = str(pkg_resources.files("myGym") / "envs")
 
 # import vision models YOLACT, VAE
-sys.path.append(os.path.join(pkg_resources.files("myGym"), "yolact_vision")) #may be moved somewhere else
+sys.path.append(str(pkg_resources.files("myGym") / "yolact_vision")) #may be moved somewhere else
 #4 lines below commented out to stop logging this error
 # try:
 #     from inference_tool import InfTool
@@ -276,7 +276,7 @@ class VisionModule:
             :param network: (string) Source of information from environment (yolact, vae)
         """
         if network == "vae":
-            weights_pth = os.path.join(pkg_resources.files("myGym"), self.vae_path)
+            weights_pth = str(pkg_resources.files("myGym") / self.vae_path)
             try:
                 self.vae_embedder, imsize = load_checkpoint(weights_pth, use_cuda=True)
             except:
@@ -284,9 +284,9 @@ class VisionModule:
             self.vae_imsize = imsize
             self.obsdim = (2*self.vae_embedder.n_latents) + 3
         elif network == "yolact":
-            weights = os.path.join(pkg_resources.files("myGym"), self.yolact_path)
+            weights = str(pkg_resources.files("myGym") / self.yolact_path)
             if ".obj" in self.yolact_config:
-                config = os.path.join(pkg_resources.files("myGym"), self.yolact_config)
+                config = str(pkg_resources.files("myGym") / self.yolact_config)
             try:
                 self.yolact_cnn = InfTool(weights=weights, config=config, score_threshold=0.2)
             except:

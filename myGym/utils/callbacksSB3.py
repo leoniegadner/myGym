@@ -451,6 +451,16 @@ class MultiPPOEvalCallback(EvalCallback):
             "mean subgoal steps": "{}".format(str(meansrs)),
         }
 
+        # Log metrics to TensorBoard using SB3 logger for comparison across algorithms
+        self._log_eval_metrics_to_tensorboard(
+            mean_reward=float(np.mean(episode_rewards)),
+            std_reward=float(np.std(episode_rewards)),
+            mean_ep_len=float(steps_sum / n_eval_episodes),
+            success_rate=float(success_episodes_num / n_eval_episodes * 100),
+            mean_distance_error=float(distance_error_sum / n_eval_episodes),
+            mean_subgoals_finished=float(meansgoals),
+        )
+
         for k, v in results.items():
             print(k, ':', v)
 
@@ -460,6 +470,17 @@ class MultiPPOEvalCallback(EvalCallback):
         print("Evaluation finished successfully")
         return results
 
+    def _log_eval_metrics_to_tensorboard(self, mean_reward, std_reward, mean_ep_len,
+                                          success_rate, mean_distance_error, mean_subgoals_finished):
+        """Log evaluation metrics to TensorBoard using standardized names for cross-algorithm comparison."""
+        if self.model is not None and hasattr(self.model, 'logger'):
+            self.model.logger.record("eval/mean_reward", mean_reward)
+            self.model.logger.record("eval/std_reward", std_reward)
+            self.model.logger.record("eval/mean_ep_length", mean_ep_len)
+            self.model.logger.record("eval/success_rate", success_rate)
+            self.model.logger.record("eval/mean_distance_to_goal", mean_distance_error)
+            self.model.logger.record("eval/mean_subgoals_finished", mean_subgoals_finished)
+            self.model.logger.dump(step=self.num_timesteps)
 
     def _init_callback(self):
         # Does not work in some corner cases, where the wrapper is different
@@ -684,6 +705,16 @@ class PPOEvalCallback(EvalCallback):
             "mean subgoal steps": "{}".format(str(meansrs)),
         }
 
+        # Log metrics to TensorBoard using SB3 logger for comparison across algorithms
+        self._log_eval_metrics_to_tensorboard(
+            mean_reward=float(np.mean(episode_rewards)),
+            std_reward=float(np.std(episode_rewards)),
+            mean_ep_len=float(steps_sum / n_eval_episodes),
+            success_rate=float(success_episodes_num / n_eval_episodes * 100),
+            mean_distance_error=float(distance_error_sum / n_eval_episodes),
+            mean_subgoals_finished=float(meansgoals),
+        )
+
         for k, v in results.items():
             print(k, ':', v)
 
@@ -692,6 +723,18 @@ class PPOEvalCallback(EvalCallback):
         end_timer = time.time()
         print("evaluation time:", end_timer - start_timer)
         return results
+
+    def _log_eval_metrics_to_tensorboard(self, mean_reward, std_reward, mean_ep_len,
+                                          success_rate, mean_distance_error, mean_subgoals_finished):
+        """Log evaluation metrics to TensorBoard using standardized names for cross-algorithm comparison."""
+        if self.model is not None and hasattr(self.model, 'logger'):
+            self.model.logger.record("eval/mean_reward", mean_reward)
+            self.model.logger.record("eval/std_reward", std_reward)
+            self.model.logger.record("eval/mean_ep_length", mean_ep_len)
+            self.model.logger.record("eval/success_rate", success_rate)
+            self.model.logger.record("eval/mean_distance_to_goal", mean_distance_error)
+            self.model.logger.record("eval/mean_subgoals_finished", mean_subgoals_finished)
+            self.model.logger.dump(step=self.num_timesteps)
 
     def _init_callback(self):
         # Does not work in some corner cases, where the wrapper is different

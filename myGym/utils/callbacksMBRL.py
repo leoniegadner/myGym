@@ -175,16 +175,14 @@ class MBRLEvalCallback(EventCallback):
         mean_subgoal_reward = float(np.mean(meansr)) if np.size(meansr) > 0 else 0.0
         mean_subgoal_steps = float(np.mean(meansrs)) if np.size(meansrs) > 0 else 0.0
 
+        # Use eval/ prefix for standardized TensorBoard metrics (comparable across algorithms)
         metrics = {
-            "mbrl/mean_return": float(np.mean(returns)),
-            "mbrl/std_return": float(np.std(returns)),
-            "mbrl/mean_ep_len": float(np.mean(lengths)),
-            "mbrl/success_rate": float(success_rate),
-            "mbrl/mean_distance_error": float(mean_distance_error),
-            "mbrl/mean_steps_num": float(mean_steps_num),
-            "mbrl/mean_subgoal_reward": mean_subgoal_reward,
-            "mbrl/mean_subgoal_steps": mean_subgoal_steps,
-            "mbrl/mean_subgoals_finished": float(meansgoals),
+            "eval/mean_reward": float(np.mean(returns)),
+            "eval/std_reward": float(np.std(returns)),
+            "eval/mean_ep_length": float(np.mean(lengths)),
+            "eval/success_rate": float(success_rate),
+            "eval/mean_distance_to_goal": float(mean_distance_error),
+            "eval/mean_subgoals_finished": float(meansgoals),
         }
 
         results = {
@@ -207,13 +205,15 @@ class MBRLEvalCallback(EventCallback):
         model_err = None
         if self.replay_buffer is not None and hasattr(self.model, "dynamics_model"):
             batch = self.replay_buffer.sample(min(256, len(self.replay_buffer)))
-            obs = batch.observations
-            act = batch.actions
-            next_obs = batch.next_observations
-            with np.errstate(all="ignore"):
-                pred_next, _ = self.model.dynamics_model.predict(obs, act, deterministic=True)
-                model_err = float(np.mean((pred_next - next_obs) ** 2))
-                metrics["mbrl/model_mse"] = model_err
+            # MBRL TransitionBatch uses 'obs', 'action', 'next_obs' attribute names
+            obs = getattr(batch, 'obs', getattr(batch, 'observations', None))
+            act = getattr(batch, 'action', getattr(batch, 'actions', None))
+            next_obs = getattr(batch, 'next_obs', getattr(batch, 'next_observations', None))
+            if obs is not None and act is not None and next_obs is not None:
+                with np.errstate(all="ignore"):
+                    pred_next, _ = self.model.dynamics_model.predict(obs, act, deterministic=True)
+                    model_err = float(np.mean((pred_next - next_obs) ** 2))
+                    metrics["train/model_mse"] = model_err
 
         model_train_metrics = getattr(self.model, "model_train_metrics", {}) or {}
         if model_train_metrics:
@@ -225,9 +225,9 @@ class MBRLEvalCallback(EventCallback):
                 "dynamics_epoch": model_train_metrics.get("epoch"),
             })
             metrics.update({
-                "mbrl/dynamics_train_loss": model_train_metrics.get("train_loss"),
-                "mbrl/dynamics_val_score": model_train_metrics.get("val_score"),
-                "mbrl/dynamics_best_val_score": model_train_metrics.get("best_val_score"),
+                "train/dynamics_train_loss": model_train_metrics.get("train_loss"),
+                "train/dynamics_val_score": model_train_metrics.get("val_score"),
+                "train/dynamics_best_val_score": model_train_metrics.get("best_val_score"),
             })
 
         self._log_tb_scalars(metrics, step_count)

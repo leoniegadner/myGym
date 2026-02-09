@@ -307,7 +307,7 @@ def main():
         workspace_info = ws_dict[workspace_key]
         
         # Load scene
-        currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
+        currentdir = str(pkg_resources.files("myGym") / "envs")
         
         # Load workspace
         workspace_urdf_path = os.path.join(currentdir, "rooms/collision/" + workspace_info['urdf'])

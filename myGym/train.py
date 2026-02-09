@@ -63,6 +63,92 @@ AVAILABLE_SIMULATION_ENGINES = ["pybullet"]
 AVAILABLE_TRAINING_FRAMEWORKS = ["pytorch"]
 
 
+def log_action_and_joint_info(env):
+    """
+    Print action space bounds and joint limits to help verify scaling.
+    """
+    try:
+        base_env = env
+        if hasattr(base_env, "envs"):  # VecEnv (e.g., SubprocVecEnv/DummyVecEnv)
+            base_env = base_env.envs[0]
+        if hasattr(base_env, "env"):  # Monitor wrapper
+            base_env = base_env.env
+        unwrapped = getattr(base_env, "unwrapped", base_env)
+        robot = getattr(unwrapped, "robot", None)
+
+        print("Action space low:", unwrapped.action_space.low)
+        print("Action space high:", unwrapped.action_space.high)
+        if robot is not None and hasattr(robot, "joints_limits"):
+            print("Joint limits lower:", robot.joints_limits[0])
+            print("Joint limits upper:", robot.joints_limits[1])
+        if robot is not None and hasattr(robot, "gjoints_limits"):
+            print("Gripper limits lower:", robot.gjoints_limits[0])
+            print("Gripper limits upper:", robot.gjoints_limits[1])
+    except Exception as exc:
+        print(f"Could not log action/joint info: {exc}")
+
+
+class ActionLoggerCallback(BaseCallback):
+    """
+    Periodically logs action statistics to the SB3 logger so we can verify scaling.
+    """
+    def __init__(self, log_every=1000, to_stdout=False, **kwargs):
+        super().__init__(**kwargs)
+        self.log_every = max(1, log_every)
+        self.to_stdout = to_stdout
+        self.joint_dim = None  # number of non-gripper action dims
+
+    def _compute_joint_dim(self):
+        """
+        Derive how many action dims belong to joints (exclude gripper dims).
+        """
+        try:
+            env = getattr(self, "training_env", None)
+            if env is None:
+                return
+            base_env = env
+            if hasattr(base_env, "envs"):
+                base_env = base_env.envs[0]
+            if hasattr(base_env, "env"):
+                base_env = base_env.env
+            unwrapped = getattr(base_env, "unwrapped", base_env)
+            robot = getattr(unwrapped, "robot", None)
+
+            gripper_dim = 0
+            if robot is not None:
+                if hasattr(robot, "gjoints_num"):
+                    gripper_dim = robot.gjoints_num
+                elif hasattr(robot, "gjoints_limits"):
+                    gripper_dim = len(robot.gjoints_limits[0])
+
+            action_dim = unwrapped.action_space.shape[0]
+            self.joint_dim = max(action_dim - gripper_dim, 0)
+        except Exception:
+            self.joint_dim = None
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_every != 0:
+            return True
+
+        actions = self.locals.get("actions")
+        if actions is None:
+            return True
+
+        if self.joint_dim is None:
+            self._compute_joint_dim()
+
+        actions_np = actions.detach().cpu().numpy() if hasattr(actions, "detach") else np.asarray(actions)
+        joint_actions = actions_np[..., :self.joint_dim] if self.joint_dim else actions_np
+
+        self.logger.record("debug/action_mean", joint_actions.mean())
+        self.logger.record("debug/action_min", joint_actions.min())
+        self.logger.record("debug/action_max", joint_actions.max())
+        if self.to_stdout:
+            print(
+                f"[ActionLogger] joints-only mean={joint_actions.mean():.3f} "
+                f"min={joint_actions.min():.3f} max={joint_actions.max():.3f}"
+            )
+        return True
 
 
 def save_results(arg_dict, model_name, env, model_logdir=None, show=False):
@@ -229,7 +315,7 @@ def train(env, implemented_combos, model_logdir, arg_dict, pretrained_model=None
         model_kwargs["seed"] = seed
     if pretrained_model:
         if not os.path.isabs(pretrained_model):
-            pretrained_model = os.path.join(pkg_resources.files("myGym"), pretrained_model)
+            pretrained_model = str(pkg_resources.files("myGym") / pretrained_model)
         env_for_load = model_args[0] if isinstance(model_args, tuple) and len(model_args) == 1 else model_args[1]
         if arg_dict["algo"] in ["aif", "meta_aif"]:
             vec_env = env_for_load

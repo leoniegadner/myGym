@@ -25,7 +25,7 @@ from stable_baselines3.common.utils import obs_as_tensor
 
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv
 
-currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
+currentdir = str(pkg_resources.files("myGym") / "envs")
 
 # used to exclude these colors for other objects, in the order of goal, init, done, else
 COLORS_RESERVED_FOR_HIGHLIGHTING = ["dark green", "green", "blue", "gray"]
@@ -303,14 +303,14 @@ class GymEnv(CameraEnv):
 
     def _load_urdf(self, path, fixedbase=True, maxcoords=True):
         transform = self.workspace_dict[self.workspace]['transform']
-        return self.p.loadURDF(os.path.join(pkg_resources.files("myGym"), os.path.join("envs", path)),
+        return self.p.loadURDF(str(pkg_resources.files("myGym") / "envs" / path),
                                transform['position'],  self.p.getQuaternionFromEuler(transform['orientation']),
                                useFixedBase=fixedbase,
                                useMaximalCoordinates=maxcoords)
     
     def _load_static_scene_urdf(self, path, name, fixedbase=True):
         transform = self.workspace_dict[self.workspace]['transform']
-        object = env_object.EnvObject(os.path.join(pkg_resources.files("myGym"), os.path.join("envs", path)), transform['position'], self.p.getQuaternionFromEuler(transform['orientation']), pybullet_client=self.p, fixed=fixedbase)
+        object = env_object.EnvObject(str(pkg_resources.files("myGym") / "envs" / path), transform['position'], self.p.getQuaternionFromEuler(transform['orientation']), pybullet_client=self.p, fixed=fixedbase)
         self.static_scene_objects[name] = object
         print(f"Loaded static scene object '{name}' from: {path}")
         print(f"Object position: {transform['position']}")
@@ -324,7 +324,7 @@ class GymEnv(CameraEnv):
 
 
     def _load_texture(self, name):
-        return self.p.loadTexture(os.path.join(pkg_resources.files("myGym"), "./envs/textures/{}".format(name)))
+        return self.p.loadTexture(str(pkg_resources.files("myGym") / "envs" / "textures" / name))
 
 
     def _set_observation_space(self):

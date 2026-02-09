@@ -10,7 +10,7 @@ import random
 from scipy.spatial.distance import cityblock
 from scipy.spatial.transform import Rotation
 from pyquaternion import Quaternion
-currentdir = os.path.join(pkg_resources.files("myGym"), "envs")
+currentdir = str(pkg_resources.files("myGym") / "envs")
 
 
 class TaskModule():
@@ -413,6 +413,18 @@ class TaskModule():
             self.env.robot.release_all_objects()
             self.subtask_over = True
             self.current_task += 1
+
+    def _log_final_distance(self):
+        """Debug helper: print end-effector to target distance at episode end."""
+        try:
+            dist = self.current_norm_distance
+            if dist is None and hasattr(self, "_observation"):
+                dist = self.calc_distance(self._observation["goal_state"], self._observation["actual_state"])
+            if dist is not None:
+                print(f"[Task] Episode end distance (endeff->target): {dist:.4f}")
+        except Exception:
+            # Best-effort debug log; ignore errors
+            pass
 
     def calc_distance(self, obj1, obj2):
         """

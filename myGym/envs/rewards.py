@@ -144,7 +144,7 @@ class Protorewards(Reward):
         self.offsetright = [-0.2, 0.0, -0.1]
         self.offsetcenter = [0.0, 0.0, -0.1]
         self.grip_threshold = 0.1
-        self.approached_threshold = 0.045
+        self.approached_threshold = 0.1
         self.withdraw_threshold = 0.3
         self.opengr_threshold = self.env.robot.opengr_threshold
         self.closegr_threshold = self.env.robot.closegr_threshold
@@ -403,7 +403,7 @@ class Protorewards(Reward):
             self.env.robot.release_object(self.env.env_objects["actual_state"])
             self.env.robot.set_magnetization(False)
             return True
-        return False
+        return True
 
     def gripper_closed(self, gripper_states):
         if sum(gripper_states) <= self.closegr_threshold:
@@ -437,7 +437,7 @@ class A(Protorewards):
         target = [[object_position, goal_position, gripper_states]][owner]
         reward = [self.approach_compute][owner](*target)
         if self.env.episode_terminated:
-            reward += 0.2 #Adding reward for succesful finish of episode
+            reward += 10 #Adding reward for succesful finish of episode
         self.last_owner = owner
         #self.disp_reward(reward, owner)
         self.rewards_history.append(reward)

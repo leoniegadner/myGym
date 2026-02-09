@@ -3,7 +3,7 @@ import numpy as np
 import os, glob, random
 import pybullet as p
 import importlib.resources as pkg_resources
-repodir = os.path.join(pkg_resources.files("myGym"), "")
+repodir = str(pkg_resources.files("myGym"))
 
 
 
