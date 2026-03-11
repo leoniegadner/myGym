@@ -1,6 +1,6 @@
 """
 Latent-state (partially observed) variant of an Amortized AIF Agent, as in
-'Scaling Active Inference' TODO: [CITE!!!].
+'Scaling Active Inference' (Tschantz et al., 2020)
 
 Key components:
 - Encoder:       q_phi(s_t | o_t)  = N(mu_phi(o_t), diag(exp(logvar_phi(o_t))))
