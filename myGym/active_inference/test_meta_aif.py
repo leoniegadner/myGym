@@ -20,7 +20,7 @@ def load_config(config_path=None):
     if config_path is None:
         # Default path relative to this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(script_dir, "..", "configs", "train_nico_meta_aif.json")
+        config_path = os.path.join(script_dir, "..", "configs", "/Users/Leonie/Desktop/Robot_Nico_Project/Project/myGym/myGym/trained_models/nico_grasp/A/joints_gripper_meta_aif_49/train.json")
 
     with open(config_path, "r") as f:
         content = f.read()
@@ -79,11 +79,13 @@ def create_test_generative_model(config=None):
     pref_model_uncert_precision = config.get("aif_meta_pref_model_uncert_precision", 1.0)
     pref_effort_precision = config.get("aif_meta_pref_effort_precision", 1.0)
 
-    # Bayesian belief parameters
-    initial_belief_alpha = config.get("aif_meta_initial_belief_alpha", 1.0)
-    initial_belief_beta = config.get("aif_meta_initial_belief_beta", 1.0)
-    observation_weight = config.get("aif_meta_observation_weight", 1.0)
-    belief_decay = config.get("aif_meta_belief_decay", 0.995)
+    # Observation preference means
+    pref_extrinsic_mean = config.get("aif_meta_pref_extrinsic_mean", 1.0)
+    pref_policy_uncert_mean = config.get("aif_meta_pref_policy_uncert_mean", 0.0)
+    pref_model_uncert_mean = config.get("aif_meta_pref_model_uncert_mean", 0.0)
+    pref_effort_mean = config.get("aif_meta_pref_effort_mean", 0.0)
+    capacity_exponent = config.get("aif_meta_capacity_exponent", 1.0)
+    variance_exponent = config.get("aif_meta_variance_exponent", 2.65)
 
     # Build mode grid with aligned parameters (low with low, high with high)
     h_vals = range_inclusive(horizon_min, horizon_max, horizon_step)
@@ -192,14 +194,16 @@ def create_test_generative_model(config=None):
         complexity=complexity,
         habit_deviation=habit_deviation,
         is_deterministic=is_deterministic,
-        initial_belief_alpha=initial_belief_alpha,
-        initial_belief_beta=initial_belief_beta,
-        observation_weight=observation_weight,
-        belief_decay=belief_decay,
         pref_extrinsic_precision=pref_extrinsic_precision,
         pref_policy_uncert_precision=pref_policy_uncert_precision,
         pref_model_uncert_precision=pref_model_uncert_precision,
         pref_effort_precision=pref_effort_precision,
+        pref_extrinsic_mean=pref_extrinsic_mean,
+        pref_policy_uncert_mean=pref_policy_uncert_mean,
+        pref_model_uncert_mean=pref_model_uncert_mean,
+        pref_effort_mean=pref_effort_mean,
+        capacity_exponent=capacity_exponent,
+        variance_exponent=variance_exponent,
     )
 
     # Create mode names
@@ -219,23 +223,23 @@ def create_test_generative_model(config=None):
     print(f"  pref_policy_uncert_precision={pref_policy_uncert_precision}")
     print(f"  pref_model_uncert_precision={pref_model_uncert_precision}")
     print(f"  pref_effort_precision={pref_effort_precision}")
-    print(f"\nBayesian belief params:")
-    print(f"  initial_alpha={initial_belief_alpha}, initial_beta={initial_belief_beta}")
-    print(f"  observation_weight={observation_weight}, belief_decay={belief_decay}")
-
+    print(f"\nObservation preference means:")
+    print(f"  pref_extrinsic_mean={pref_extrinsic_mean}")
+    print(f"  pref_policy_uncert_mean={pref_policy_uncert_mean}")
+    print(f"  pref_model_uncert_mean={pref_model_uncert_mean}")
+    print(f"  pref_effort_mean={pref_effort_mean}")
     return model, mode_names, modes
 
 
-def test_scenario(model, mode_names, scenario_name, features, n_updates=5):
+def test_scenario(model, mode_names, scenario_name, features):
     """
-    Test a scenario by running Bayesian updates and computing EFE.
+    Test a scenario by computing EFE with point-estimate θ.
 
     Args:
         model: MetaGenerativeModel instance
         mode_names: List of mode names
         scenario_name: Description of the scenario
         features: Dict with model_error, model_uncert, policy_uncert, extrinsic_value
-        n_updates: Number of Bayesian updates to run before final selection
     """
     print(f"\n{'='*70}")
     print(f"SCENARIO: {scenario_name}")
@@ -244,19 +248,6 @@ def test_scenario(model, mode_names, scenario_name, features, n_updates=5):
           f"model_uncert={features['model_uncert']:.2f}, "
           f"policy_uncert={features['policy_uncert']:.2f}, "
           f"extrinsic_value={features['extrinsic_value']:.2f}")
-
-    # Reset belief to uniform prior
-    model._belief_alpha = 1.0
-    model._belief_beta = 1.0
-
-    # Run several Bayesian updates to let belief converge
-    print(f"\nRunning {n_updates} Bayesian updates...")
-    for i in range(n_updates):
-        normalized = model.normalize_features(features)
-        belief_info = model.bayesian_update(normalized)
-        if i == 0 or i == n_updates - 1:
-            print(f"  Update {i+1}: belief_mean={belief_info['belief_mean']:.3f}, "
-                  f"belief_concentration={belief_info['belief_concentration']:.1f}")
 
     # Compute EFE scores
     scores, debug_info = model.expected_free_energy(features)
@@ -274,13 +265,9 @@ def test_scenario(model, mode_names, scenario_name, features, n_updates=5):
     best_idx = int(np.argmin(scores))
     print(f"\n>>> SELECTED MODE: {mode_names[best_idx]} (index {best_idx})")
 
-    # Show theta prior info
-    theta_prior = debug_info.get("theta_prior", {})
-    print(f"\nPolicy quality belief (theta prior):")
-    print(f"  mean={theta_prior.get('mean', 0.5):.3f}, "
-          f"concentration={theta_prior.get('concentration', 2.0):.1f}, "
-          f"alpha={theta_prior.get('alpha', 1.0):.2f}, "
-          f"beta={theta_prior.get('beta', 1.0):.2f}")
+    # Show theta point estimate
+    theta = debug_info.get("theta", 0.5)
+    print(f"\nPolicy quality point estimate: theta={theta:.3f}")
 
     return best_idx, mode_names[best_idx]
 
@@ -298,9 +285,9 @@ def main():
         "BAD MODEL + BAD POLICY",
         {
             "model_error": 1.0,      # High error (bad predictions)
-            "model_uncert": 1.0,     # High uncertainty
-            "policy_uncert": 0.9,    # High policy uncertainty
-            "extrinsic_value": 0.0, # Negative improvement (getting worse)
+            "model_uncert": 0.9,     # High uncertainty
+            "policy_uncert": 0.6,    # High policy uncertainty
+            "extrinsic_value": 0.6,  # little improvement 
         }
     )
 
@@ -310,10 +297,10 @@ def main():
         model, mode_names,
         "GOOD MODEL + BAD POLICY",
         {
-            "model_error": -4.8,      # Low error (good predictions)
-            "model_uncert": 0.0001,     # Low uncertainty
-            "policy_uncert": 0.4,    # High policy uncertainty
-            "extrinsic_value": 0.2, # Slightly negative (not improving)
+            "model_error": -4.7,     # Low error (good predictions)
+            "model_uncert": 0.001,  # Low uncertainty
+            "policy_uncert": 0.11,    # High policy uncertainty
+            "extrinsic_value": 0.27,  # little improvement
         }
     )
 
@@ -323,10 +310,10 @@ def main():
         model, mode_names,
         "GOOD MODEL + GOOD POLICY",
         {
-            "model_error": -4.9,      # Low error
-            "model_uncert": 0.0001,     # Low uncertainty
-            "policy_uncert": 0.577,    # Low policy uncertainty
-            "extrinsic_value": 0.795,  # Strong positive improvement
+            "model_error": -4.9,     # Low error
+            "model_uncert": 0.0001,  # Low uncertainty
+            "policy_uncert": 0.05,    # Low policy uncertainty
+            "extrinsic_value": 0.7,  # Strong positive improvement
         }
     )
 
@@ -338,8 +325,8 @@ def main():
         {
             "model_error": 3.0,      # High error
             "model_uncert": 1.5,     # High uncertainty
-            "policy_uncert": 0.2,    # Low policy uncertainty
-            "extrinsic_value": 0.5,  # Positive improvement
+            "policy_uncert": 0.1,    # Low policy uncertainty
+            "extrinsic_value": 0.9,  # Positive improvement
         }
     )
 
@@ -352,7 +339,7 @@ def main():
             "model_error": -1.0,
             "model_uncert": 0.2,
             "policy_uncert": 0.5,
-            "extrinsic_value": 0.0,  # No improvement
+            "extrinsic_value": 0.5,  # No improvement
         }
     )
 

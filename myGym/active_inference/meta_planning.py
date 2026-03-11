@@ -17,7 +17,7 @@ class MetaFeatures:
     model_error: float = 0.0  # Proxy for ambiguity potential
     model_uncert: float = 0.0  # Epistemic uncertainty (model)
     policy_uncert: float = 0.0  # Epistemic uncertainty (policy)
-    extrinsic_value: float = 0.0  # Policy success: improvement rate toward preferred state (positive = improving)
+    extrinsic_value: float = 0.0  # Policy success: mean per-step distance reduction toward target / max possible (positive = improving)
 
     @property
     def total_uncertainty(self) -> float:
@@ -43,13 +43,18 @@ class MetaFeatures:
 
 class MetaGenerativeModel:
     """
-    Explicit specification of a meta-level generative model with hidden policy quality.
+    Explicit specification of a meta-level generative model with point-estimate
+    policy quality.
 
-    Hidden state:
-      - θ ∈ [0, 1] (policy quality)
-
-    Prior belief:
-      - Q(θ): current uncertainty about policy quality (Beta distribution)
+    Policy quality (composite point estimate):
+      - θ_π = 1 - normalized_policy_uncert (policy uncertainty signal)
+      - θ_v = (1 + normalized_extrinsic_value) / 2 (performance signal)
+      - ρ = 1 - min(1, λ · normalized_model_uncert) (model reliability gate)
+      - θ = θ_π + w_v · ρ · (θ_v - θ_π)  (interpolation)
+      - High policy_uncert → low θ → favor deliberative modes
+      - Low policy_uncert → high θ → favor deterministic mode
+      - Good performance + reliable model pulls θ up (earlier habituation)
+      - Bad performance + reliable model pulls θ down (triggers deliberation)
 
     Likelihood:
       - P(o | θ, mode): how observations depend on policy quality and mode
@@ -64,9 +69,8 @@ class MetaGenerativeModel:
 
     Expected Free Energy:
       - G = Ambiguity + Risk
-      - Ambiguity = E_Q(θ)[H(P(o|θ, mode))] - uncertainty about outcomes
-      - Risk = KL[q(o|mode) || p(o|C)] - divergence from preferred observations
-        where q(o|mode) = E_Q(θ)[P(o|θ, mode)]
+      - Ambiguity = H(P(o|θ, mode)) - uncertainty about outcomes at point θ
+      - Risk = KL[P(o|θ, mode) || p(o|C)] - divergence from preferred observations
 
     This formulation properly separates the action space (modes) from the state/
     observation space, computing risk as how far expected observations under each
@@ -82,34 +86,39 @@ class MetaGenerativeModel:
         complexity: np.ndarray,
         habit_deviation: np.ndarray,
         is_deterministic: np.ndarray,
-        initial_belief_alpha: float = 1.0,
-        initial_belief_beta: float = 1.0,
-        observation_weight: float = 1.0,
-        belief_decay: float = 0.995,
         pref_extrinsic_precision: float = 1.0,
         pref_policy_uncert_precision: float = 1.0,
         pref_model_uncert_precision: float = 1.0,
         pref_effort_precision: float = 1.0,
+        pref_extrinsic_mean: float = 1.0,
+        pref_policy_uncert_mean: float = 0.0,
+        pref_model_uncert_mean: float = 0.0,
+        pref_effort_mean: float = 0.0,
+        capacity_exponent: float = 1.0,
+        variance_exponent: float = 2.65,
+        extrinsic_value_weight: float = 0.3,
+        risk_include_variance: bool = False,
     ):
         """
         Initialize the meta generative model with pre-computed mode arrays.
 
         Args:
-            policy_ambiguity_weight: Weight on ambiguity term E_Q[H(P(o|θ, mode))]
+            policy_ambiguity_weight: Weight on ambiguity term H(P(o|θ, mode))
             model_ambiguity_weight: Scales model uncertainty in likelihood sharpness
             total_capacity: Planning capacity per mode [n_modes]
             depth_capacity: Horizon depth per mode [n_modes]
             complexity: Computational complexity per mode [n_modes]
             habit_deviation: Deviation from habitual prior per mode [n_modes]
             is_deterministic: Boolean mask for deterministic modes [n_modes]
-            initial_belief_alpha: Initial α for Beta prior over policy quality
-            initial_belief_beta: Initial β for Beta prior over policy quality
-            observation_weight: Base pseudo-count weight per observation
-            belief_decay: Decay factor for belief (1.0 = no decay, <1.0 allows adaptation)
-            pref_extrinsic_precision: Precision for extrinsic_value preference (μ=1)
-            pref_policy_uncert_precision: Precision for policy_uncert preference (μ=0)
-            pref_model_uncert_precision: Precision for model_uncert preference (μ=0)
-            pref_effort_precision: Precision for effort preference (μ=0)
+            pref_extrinsic_precision: Precision for extrinsic_value preference
+            pref_policy_uncert_precision: Precision for policy_uncert preference
+            pref_model_uncert_precision: Precision for model_uncert preference
+            pref_effort_precision: Precision for effort preference
+            pref_extrinsic_mean: Preferred mean for extrinsic_value (1.0 = prefer high)
+            pref_policy_uncert_mean: Preferred mean for policy_uncert (0.0 = prefer low)
+            pref_model_uncert_mean: Preferred mean for model_uncert (0.0 = prefer low)
+            pref_effort_mean: Preferred mean for effort (0.0 = prefer low)
+            capacity_exponent: Exponent applied to normalized capacity (<1 compresses differences, >1 amplifies)
         """
         self.policy_ambiguity_weight = policy_ambiguity_weight
         self.model_ambiguity_weight = model_ambiguity_weight
@@ -119,6 +128,24 @@ class MetaGenerativeModel:
         self.pref_policy_uncert_precision = pref_policy_uncert_precision
         self.pref_model_uncert_precision = pref_model_uncert_precision
         self.pref_effort_precision = pref_effort_precision
+
+        # Observation preference means
+        self.pref_extrinsic_mean = pref_extrinsic_mean
+        self.pref_policy_uncert_mean = pref_policy_uncert_mean
+        self.pref_model_uncert_mean = pref_model_uncert_mean
+        self.pref_effort_mean = pref_effort_mean
+
+        # Capacity exponent (<1 compresses differences between modes, >1 amplifies)
+        self.capacity_exponent = capacity_exponent
+        self.variance_exponent = variance_exponent
+
+        # Weight on extrinsic value signal in composite θ estimate
+        self.extrinsic_value_weight = max(0.0, min(1.0, float(extrinsic_value_weight)))
+
+        # If True, include τ·σ² variance term in risk (full KL).
+        # Gives independent control over variance preference via precisions (τ),
+        # separate from the ambiguity term which uses policy_ambiguity_weight.
+        self.risk_include_variance = bool(risk_include_variance)
 
         # Pre-computed mode characteristics (vectorized)
         self._total_capacity = total_capacity
@@ -131,23 +158,6 @@ class MetaGenerativeModel:
         self._max_capacity = np.max(total_capacity) + 1e-6
         self._max_depth = max(np.max(depth_capacity), 1.0)
         self._max_complexity = np.max(complexity) + 1e-6
-
-        # Numerical integration grid for policy quality θ ∈ (0, 1)
-        self._theta_eps = 1e-6
-        self._theta_grid = np.linspace(self._theta_eps, 1.0 - self._theta_eps, num=51, dtype=np.float64)
-        self._theta_min_concentration = 2.0  # Uniform Beta when policy_uncert is maximal
-        self._theta_max_concentration = 50.0  # Narrow Beta when policy_uncert is minimal
-        self._policy_quality_mean = 0.5  # Default mean when no estimate is available
-        self._min_sensitivity = 0.1
-        self._sensitivity_gain = 1.0
-        self._entropy_norm = math.log(2.0)
-
-        # Persistent Bayesian belief over policy quality θ ~ Beta(α, β)
-        # This is the posterior from previous observations, used as prior for next decision
-        self._belief_alpha: float = float(initial_belief_alpha)
-        self._belief_beta: float = float(initial_belief_beta)
-        self._observation_weight: float = float(observation_weight)
-        self._belief_decay: float = float(belief_decay)
 
     def normalize_features(self, features: Dict[str, Any]) -> Dict[str, float]:
         """
@@ -177,8 +187,8 @@ class MetaGenerativeModel:
         # Saturation x/(1+x) for uncertainties: [0, ∞) → [0, 1)
         normalized_model_uncert = raw_model_uncert / (1.0 + raw_model_uncert)
         normalized_policy_uncert = raw_policy_uncert / (1.0 + raw_policy_uncert)
-        # Tanh for extrinsic value: (-∞, +∞) → (-1, 1), positive = improvement
-        normalized_extrinsic_value = math.tanh(raw_extrinsic_value)
+        # Extrinsic value already tanh-normalized before EMA, clamp for safety
+        normalized_extrinsic_value = max(-1.0, min(1.0, raw_extrinsic_value))
         # Reliability: both error and uncertainty must be low
         # Clamp to prevent underflow (exp of large negative → 0)
         uncert_factor = math.exp(-min(500.0, raw_model_uncert))
@@ -192,150 +202,13 @@ class MetaGenerativeModel:
             "model_reliability": model_reliability,
         }
 
-    def bayesian_update(
-        self, normalized_observations: Dict[str, float], mode_idx: int = 0
-    ) -> Dict[str, float]:
-        """
-        Bayesian update of system quality belief based on multiple observations.
-
-        Uses the same likelihood model as EFE computation (_likelihood):
-          P(o | θ, mode) is a multivariate Gaussian over observations.
-
-        The observations were generated under a specific mode, so we condition
-        on that mode when computing the likelihood for inference.
-
-        Inference:
-          posterior(θ) ∝ P(observations | θ, mode) × prior(θ)
-
-        Uses moment-matching to fit posterior to Beta distribution.
-
-        Args:
-            normalized_observations: Dict with normalized features
-            mode_idx: Index of the mode that was active when observations were generated
-
-        Returns:
-            Dict with updated belief parameters for logging
-        """
-        # Get actual observations
-        obs_ev = float(normalized_observations.get("normalized_extrinsic_value", 0.0))
-        obs_pu = float(normalized_observations.get("normalized_policy_uncert", 0.5))
-        obs_mu = float(normalized_observations.get("normalized_model_uncert", 0.5))
-        observations = np.array([obs_ev, obs_pu, obs_mu])  # [3]
-
-        # Apply decay to allow adaptation to non-stationary quality
-        if self._belief_decay < 1.0:
-            self._belief_alpha = 1.0 + self._belief_decay * (self._belief_alpha - 1.0)
-            self._belief_beta = 1.0 + self._belief_decay * (self._belief_beta - 1.0)
-
-        # Compute prior weights over θ grid
-        prior_weights = self._beta_weights(self._belief_alpha, self._belief_beta)
-
-        # Get likelihood parameters from the generative model
-        # expected: [n_theta, n_modes, 3], variances: [n_theta, n_modes, 3]
-        expected, variances = self._likelihood(self._theta_grid, normalized_observations)
-
-        # Extract parameters for the specific mode that generated the observations
-        # expected_mode: [n_theta, 3], variances_mode: [n_theta, 3]
-        expected_mode = expected[:, mode_idx, :]
-        variances_mode = variances[:, mode_idx, :]
-
-        # Scale variances by observation weight (lower weight = higher variance = less informative)
-        variances_mode = variances_mode / (self._observation_weight + 1e-6)
-
-        # Compute log-likelihood for each θ: log P(observations | θ, mode)
-        # Sum over observation dimensions (assuming independence)
-        diff = observations[None, :] - expected_mode  # [n_theta, 3]
-        log_likelihood = -0.5 * np.sum(diff**2 / (variances_mode + 1e-12), axis=-1)  # [n_theta]
-        log_likelihood = log_likelihood - np.max(log_likelihood)
-        likelihood = np.exp(log_likelihood)
-
-        # Posterior ∝ likelihood × prior
-        unnormalized_posterior = likelihood * prior_weights
-        posterior_weights = unnormalized_posterior / (np.sum(unnormalized_posterior) + 1e-12)
-
-        # Compute posterior moments
-        posterior_mean = float(np.sum(posterior_weights * self._theta_grid))
-        posterior_var = float(np.sum(posterior_weights * (self._theta_grid - posterior_mean) ** 2))
-
-        # Fit Beta to posterior moments (method of moments)
-        posterior_mean = max(self._theta_eps, min(1.0 - self._theta_eps, posterior_mean))
-        max_var = posterior_mean * (1.0 - posterior_mean) - 1e-6
-        if posterior_var > 0 and posterior_var < max_var:
-            concentration = posterior_mean * (1.0 - posterior_mean) / posterior_var - 1.0
-            concentration = max(self._theta_min_concentration, min(100.0, concentration))
-            self._belief_alpha = posterior_mean * concentration
-            self._belief_beta = (1.0 - posterior_mean) * concentration
-
-        return {
-            "belief_alpha": self._belief_alpha,
-            "belief_beta": self._belief_beta,
-            "belief_mean": self._belief_alpha / (self._belief_alpha + self._belief_beta),
-            "belief_concentration": self._belief_alpha + self._belief_beta,
-            "posterior_mean": posterior_mean,
-            "posterior_var": posterior_var,
-        }
-
-    def _theta_prior(self, normalized_features: Dict[str, float]) -> Dict[str, Any]:
-        """
-        Construct Q(θ) using the persistent Bayesian belief.
-
-        The belief (α, β) is updated via bayesian_update() and represents our
-        posterior over policy quality from all previous observations. This posterior
-        becomes the prior for the current decision.
-
-        Policy uncertainty from the current state modulates how much we trust
-        the accumulated belief vs. being more uncertain:
-          - High policy_uncert → scale down effective counts (spread out the prior)
-          - Low policy_uncert → use full belief concentration
-        """
-        policy_uncert = float(normalized_features["normalized_policy_uncert"])
-
-        # Use persistent Bayesian belief as base
-        alpha_belief = self._belief_alpha
-        beta_belief = self._belief_beta
-        belief_mean = alpha_belief / (alpha_belief + beta_belief)
-        belief_concentration = alpha_belief + beta_belief
-
-        # Policy uncertainty modulates effective concentration
-        # High uncertainty → treat as if we have less data (scale down counts)
-        # This allows current state information to influence the prior spread
-        uncertainty_scale = 1.0 - 0.5 * policy_uncert  # Range [0.5, 1.0]
-        effective_concentration = max(
-            self._theta_min_concentration,
-            belief_concentration * uncertainty_scale
-        )
-
-        # Reconstruct α, β with scaled concentration but preserved mean
-        alpha = belief_mean * effective_concentration
-        beta = (1.0 - belief_mean) * effective_concentration
-
-        weights = self._beta_weights(alpha, beta)
-        return {
-            "mean": belief_mean,
-            "concentration": effective_concentration,
-            "alpha": alpha,
-            "beta": beta,
-            "belief_alpha": alpha_belief,
-            "belief_beta": beta_belief,
-            "weights": weights,
-        }
-
-    def _beta_weights(self, alpha: float, beta: float) -> np.ndarray:
-        """Return normalized Beta(α, β) weights over the θ grid."""
-        theta = self._theta_grid
-        log_beta = math.lgamma(alpha) + math.lgamma(beta) - math.lgamma(alpha + beta)
-        log_pdf = (alpha - 1.0) * np.log(theta) + (beta - 1.0) * np.log(1.0 - theta) - log_beta
-        log_pdf = log_pdf - np.max(log_pdf)
-        weights = np.exp(log_pdf)
-        return weights / (np.sum(weights) + 1e-12)
-
     def _likelihood(
-        self, theta_values: np.ndarray, normalized_features: Dict[str, float]
+        self, theta: float, normalized_features: Dict[str, float]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute likelihood P(o | θ, mode) for all θ and modes.
+        Compute likelihood P(o | θ, mode) for a single scalar θ and all modes.
 
-        Generative model: observations given hidden state θ and planning mode.
+        Generative model: observations given policy quality θ and planning mode.
 
         P(o | θ, mode) is a multivariate Gaussian over:
           - extrinsic_value | θ, mode ~ N(μ_ev(θ, mode), σ²_ev(θ, mode))
@@ -344,81 +217,71 @@ class MetaGenerativeModel:
 
         Mode affects extrinsic value prediction:
           - Higher capacity modes leverage good θ more effectively
-          - μ_ev(θ, mode) = (2θ - 1) + capacity × θ × (1 - model_uncert)
           - Planning amplifies θ when model is reliable
 
         Mode affects precision of extrinsic value:
           - Higher capacity + good θ → more predictable outcomes
-          - σ²_ev(θ, mode) = base_var / (1 + capacity × θ)
-        
+
         Key insight: Planning helps when model is GOOD and θ is BAD.
-        The variance of outcomes should differ DRAMATICALLY based on mode:
-        - No planning + bad θ: very unpredictable outcomes
-        - Planning + good model + bad θ: can predict improvement
+
+        Model reliability (ρ) is used here as a STRUCTURAL property — "does
+        planning actually work with this model?" — distinct from its
+        epistemological role in θ ("should I trust performance evidence?").
+
+        Args:
+            theta: Scalar policy quality in [0, 1]
+            normalized_features: Dict with normalized feature values
 
         Returns:
-            Tuple of (expected_observations, variances) each [n_theta, n_modes, 3]
+            Tuple of (expected_observations, variances) each [n_modes, 3]
             where 3 = (extrinsic_value, policy_uncert, model_uncert)
         """
+        # Model reliability: structural property of whether planning is effective.
         model_uncert = float(normalized_features["normalized_model_uncert"])
         model_reliability = 1.0 - min(1.0, model_uncert * self.model_ambiguity_weight)
 
-        capacity = np.clip(self._total_capacity / self._max_capacity, 0.0, 1.0)
-        capacity = capacity[None, :]  # [1, n_modes]
-        theta = theta_values[:, None]  # [n_theta, 1]
-        n_theta = len(theta_values)
+        capacity_raw = np.clip(self._total_capacity / self._max_capacity, 0.0, 1.0)
+        capacity = np.power(capacity_raw, self.capacity_exponent)
         n_modes = len(self._total_capacity)
 
-        room_to_improve = 1.0 - theta
+        # Room to improve: derived ONLY from θ (which already incorporates
+        # extrinsic value via the composite estimate). No extrinsic_gap.
+        room_to_improve = max(0.0, 1.0 - theta)
 
         # === EXPECTED EXTRINSIC VALUE ===
         base_ev = 2.0 * theta - 1.0
-        planning_boost = capacity * room_to_improve * model_reliability
-        mu_ev = np.clip(base_ev + planning_boost, -1.0, 1.0)
+        planning_boost = capacity * room_to_improve * model_reliability  # [n_modes]
+        mu_ev = base_ev + planning_boost  # no upper clip
 
         # === VARIANCE OF EXTRINSIC VALUE ===
-        # Requirements:
-        # 1. World model BAD + policy quality BAD → HIGH variance for BOTH modes
-        # 2. World model GOOD + policy variance HIGH → LOW for deliberate, HIGH for deterministic
-        # 3. Policy quality GOOD + variance LOW → LOW for deterministic (so it can take over)
-
         # Deterministic mode: variance from policy quality
         # When theta is high → low variance (good policy = predictable)
         # When theta is low → high variance (bad policy = unpredictable)
-        var_deterministic = 0.01 + room_to_improve**2.65  # [n_theta, 1]
+        var_deterministic = 0.01 + room_to_improve**self.variance_exponent  # scalar
 
-        # Deliberate mode: planning can reduce variance when there's room to improve AND model is good
-        # Key insight:
-        #   - When room_to_improve is HIGH and model is GOOD → planning reduces variance significantly
-        #   - When room_to_improve is LOW (theta is high) → planning benefit is minimal
-        #   - When model is BAD → planning adds noise instead of reducing it
+        # Deliberate mode: planning can reduce variance when model is good
         model_unreliability = 1.0 - model_reliability
-
-        # Planning benefit scales with both room to improve AND model reliability
-        planning_variance_reduction = room_to_improve**2 * model_reliability * 0.8  # Can reduce up to 80%
-        planning_noise = model_unreliability * 1.0  # But adds noise when model is bad
+        planning_variance_reduction = room_to_improve**2 * model_reliability * 0.8
+        planning_noise = model_unreliability * 1.0
 
         var_deliberate = var_deterministic - planning_variance_reduction + planning_noise
-        var_deliberate = np.maximum(var_deliberate, 0.01)  # Ensure minimum variance
+        var_deliberate = max(var_deliberate, 0.01)
 
         # Interpolate based on capacity
-        var_ev = var_deterministic * (1.0 - capacity) + var_deliberate * capacity
-
-        # Ensure minimum variance for numerical stability
+        var_ev = var_deterministic * (1.0 - capacity) + var_deliberate * capacity  # [n_modes]
         var_ev = np.maximum(var_ev, 0.01)
 
         # === POLICY/MODEL UNCERTAINTY (mode-independent) ===
-        mu_pu = 1.0 - theta
-        mu_mu = 1.0 - theta
-        # These use fixed variance since they don't depend on mode choice
-        var_pu = np.full((n_theta, n_modes), 0.25)
-        var_mu = np.full((n_theta, n_modes), 0.25)
+        mu_pu = 1.0 - theta  # scalar
+        mu_mu = 1.0 - theta  # scalar
+        var_pu = np.full(n_modes, 0.25)
+        var_mu = np.full(n_modes, 0.25)
 
-        # Stack into [n_theta, n_modes, 3]
+        # Stack into [n_modes, 3]
         expected = np.stack([
             mu_ev,
-            np.broadcast_to(mu_pu, (n_theta, n_modes)),
-            np.broadcast_to(mu_mu, (n_theta, n_modes))
+            np.full(n_modes, mu_pu),
+            np.full(n_modes, mu_mu),
         ], axis=-1)
         variances = np.stack([var_ev, var_pu, var_mu], axis=-1)
 
@@ -437,74 +300,71 @@ class MetaGenerativeModel:
         Returns Gaussian preference parameters for each observation dimension.
         """
         return {
-            "extrinsic_value": {"mean": 1.0, "precision": self.pref_extrinsic_precision},
-            "policy_uncert": {"mean": 0.0, "precision": self.pref_policy_uncert_precision},
-            "model_uncert": {"mean": 0.0, "precision": self.pref_model_uncert_precision},
-            "effort": {"mean": 0.0, "precision": self.pref_effort_precision},
+            "extrinsic_value": {"mean": self.pref_extrinsic_mean, "precision": self.pref_extrinsic_precision},
+            "policy_uncert": {"mean": self.pref_policy_uncert_mean, "precision": self.pref_policy_uncert_precision},
+            "model_uncert": {"mean": self.pref_model_uncert_mean, "precision": self.pref_model_uncert_precision},
+            "effort": {"mean": self.pref_effort_mean, "precision": self.pref_effort_precision},
         }
 
     def _expected_observations(
-        self, theta_values: np.ndarray, theta_weights: np.ndarray,
-        normalized_features: Dict[str, float]
+        self, theta: float, normalized_features: Dict[str, float]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute q(o|mode) = E_Q(θ)[P(o|θ, mode)] for each mode.
+        Compute P(o|θ, mode) for each mode at a single θ point.
 
         Returns:
             expected_obs: [n_modes, 4] - expected observation per mode
             obs_variance: [n_modes, 4] - variance of observations per mode
         """
-        expected, variances = self._likelihood(theta_values, normalized_features)
-        # expected: [n_theta, n_modes, 3], variances: [n_theta, n_modes, 3]
-
-        # Marginalize over θ: E_Q(θ)[μ(θ, mode)]
-        # weights: [n_theta] -> [n_theta, 1, 1] for broadcasting
-        w = theta_weights[:, None, None]
-
-        expected_obs = np.sum(expected * w, axis=0)  # [n_modes, 3]
-
-        # Total variance = E[Var] + Var[E] (law of total variance)
-        expected_var = np.sum(variances * w, axis=0)  # E[Var]
-        var_of_expected = np.sum(w * (expected - expected_obs[None, :, :]) ** 2, axis=0)  # Var[E]
-        obs_variance = expected_var + var_of_expected  # [n_modes, 3]
+        expected, variances = self._likelihood(theta, normalized_features)
+        # expected: [n_modes, 3], variances: [n_modes, 3]
 
         # Add effort as 4th observation dimension
-        # P(effort | mode) = δ(effort - normalized_cost[mode])
-        # So expected effort = normalized_cost, variance ≈ 0 (deterministic)
         normalized_cost = self._complexity / (self._max_complexity + 1e-6)  # [n_modes]
 
         expected_obs = np.concatenate([
-            expected_obs,
+            expected,
             normalized_cost[:, None]  # [n_modes, 1]
         ], axis=-1)  # [n_modes, 4]
 
         obs_variance = np.concatenate([
-            obs_variance,
-            np.full((len(self._complexity), 1), 1e-6)  # near-zero variance for deterministic effort
+            variances,
+            np.full((len(self._complexity), 1), 1e-6)
         ], axis=-1)  # [n_modes, 4]
 
         return expected_obs, obs_variance
 
     def _compute_risk(
-        self, theta_values: np.ndarray, theta_weights: np.ndarray,
-        normalized_features: Dict[str, float]
+        self, theta: float, normalized_features: Dict[str, float]
     ) -> np.ndarray:
         """
-        Compute Risk = KL[q(o|mode) || p(o|C)] for each mode.
+        Compute Risk for each mode.
 
-        For Gaussian q and p, KL has closed form:
-        KL = 0.5 * (log(σ_p²/σ_q²) + σ_q²/σ_p² + (μ_q - μ_p)²/σ_p² - 1)
+        When risk_include_variance is False (default):
+            Risk = Σ_d τ_d · (μ_d - μ_pref_d)²
+            Uses only the mean-deviation term (limit of KL as preference
+            variance → ∞). Simple and avoids overlap with ambiguity.
+
+        When risk_include_variance is True (full KL):
+            Risk = Σ_d τ_d · [(μ_d - μ_pref_d)² + σ²_d]
+            Adds the τ_d · σ²_d variance term. This gives independent control
+            over variance preference via τ_d, separate from the ambiguity term
+            which uses policy_ambiguity_weight. For extrinsic value, deliberative
+            modes have lower σ² than deterministic (when model is reliable), so
+            this term provides additional preference for deliberation.
+
+        Extrinsic value uses one-sided risk: only penalizes when predicted value
+        is below the preference mean. Exceeding the preference incurs zero risk.
 
         Returns:
-            risk: [n_modes] - KL divergence for each mode
+            risk: [n_modes] - weighted risk from preferences
         """
         prefs = self._observation_preferences()
         expected_obs, obs_variance = self._expected_observations(
-            theta_values, theta_weights, normalized_features
+            theta, normalized_features
         )
         # expected_obs: [n_modes, 4], obs_variance: [n_modes, 4]
 
-        # Build preference parameters as arrays
         pref_means = np.array([
             prefs["extrinsic_value"]["mean"],
             prefs["policy_uncert"]["mean"],
@@ -519,57 +379,46 @@ class MetaGenerativeModel:
             prefs["effort"]["precision"],
         ])  # [4]
 
-        pref_variances = 1.0 / (pref_precisions + 1e-6)  # [4]
+        mu_diff = expected_obs - pref_means[None, :]  # [n_modes, 4]
+        # One-sided extrinsic risk: only penalize when predicted value is BELOW
+        # the preference mean (undershooting). Exceeding the preference is fine.
+        mu_diff[:, 0] = np.minimum(mu_diff[:, 0], 0.0)
+        mu_diff_sq = mu_diff ** 2  # [n_modes, 4]
+        risk = np.sum(pref_precisions[None, :] * mu_diff_sq, axis=-1)  # [n_modes]
 
-        # KL[q || p] for each mode, summed over observation dimensions
-        # Using simplified form for Gaussians
-        mu_diff_sq = (expected_obs - pref_means[None, :]) ** 2  # [n_modes, 4]
-
-        # KL = 0.5 * (σ_q²/σ_p² + (μ_q - μ_p)²/σ_p² - 1 + log(σ_p²/σ_q²))
-        kl_per_dim = 0.5 * (
-            obs_variance / pref_variances[None, :] +
-            mu_diff_sq / pref_variances[None, :] - 1.0 +
-            np.log(pref_variances[None, :] / (obs_variance + 1e-6))
-        )  # [n_modes, 4]
-
-        risk = np.sum(kl_per_dim, axis=-1)  # [n_modes]
+        if self.risk_include_variance:
+            # Full KL: add τ_d · σ²_d for each observation dimension
+            variance_risk = np.sum(pref_precisions[None, :] * obs_variance, axis=-1)  # [n_modes]
+            risk = risk + variance_risk
 
         return risk
 
-    def _expected_entropy(
-        self, theta_values: np.ndarray, theta_weights: np.ndarray,
-        normalized_features: Dict[str, float]
+    def _compute_entropy(
+        self, theta: float, normalized_features: Dict[str, float]
     ) -> np.ndarray:
         """
-        Compute E_Q(θ)[H(P(o | θ, mode))] for all modes.
-        
-        IMPORTANT: Only extrinsic_value variance is mode-conditional.
+        Compute H(P(o | θ, mode)) for all modes at a single θ point.
+
+        Only extrinsic_value variance is mode-conditional.
         We focus the ambiguity calculation on this dimension to avoid
         diluting the signal with mode-independent observations.
         """
-        _, variances = self._likelihood(theta_values, normalized_features)
-        # variances: [n_theta, n_modes, 3]
-        
-        # Option A: Use only extrinsic value for ambiguity (conceptually cleanest)
-        var_ev = variances[:, :, 0]  # [n_theta, n_modes]
-        
+        _, variances = self._likelihood(theta, normalized_features)
+        # variances: [n_modes, 3]
+
+        var_ev = variances[:, 0]  # [n_modes]
+
         # Differential entropy of Gaussian: H = 0.5 * log(2πeσ²)
-        # For comparison across modes, we can use 0.5 * log(σ²)
         log_var_ev = np.log(var_ev + 1e-12)
         entropy = 0.5 * (1.0 + np.log(2 * np.pi) + log_var_ev)
-        
-        # Normalize to reasonable range [0, 1]
-        # With var ranging from 0.05 to 1.0:
-        #   log(0.05) ≈ -3.0, log(1.0) = 0
-        #   entropy range ≈ [0.5*(1+1.84-3), 0.5*(1+1.84+0)] = [-0.08, 1.42]
-        # Shift and scale to [0, 1]
-        entropy_min = 0.5 * (1.0 + np.log(2 * np.pi) + np.log(0.01))  # min possible
-        entropy_max = 0.5 * (1.0 + np.log(2 * np.pi) + np.log(2.0))   # max possible
+
+        # Normalize to [0, 1]
+        entropy_min = 0.5 * (1.0 + np.log(2 * np.pi) + np.log(0.01))
+        entropy_max = 0.5 * (1.0 + np.log(2 * np.pi) + np.log(2.0))
         entropy = (entropy - entropy_min) / (entropy_max - entropy_min + 1e-6)
         entropy = np.clip(entropy, 0.0, 1.0)
 
-        # Expected entropy under Q(θ)
-        return np.sum(entropy * theta_weights[:, None], axis=0)  # [n_modes]
+        return entropy  # [n_modes]
 
     def expected_free_energy(self, features: Dict[str, Any]) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
@@ -578,14 +427,8 @@ class MetaGenerativeModel:
         G = Ambiguity + Risk
 
         where:
-          - Ambiguity = E_Q(θ)[H(P(o|θ, mode))] (uncertainty about outcomes)
-          - Risk = KL[q(o|mode) || p(o|C)] (divergence from preferred observations)
-
-        Preferences p(o|C) are now properly defined over OBSERVATIONS, not modes:
-          - extrinsic_value: prefer high (close to 1)
-          - policy_uncert: prefer low (close to 0)
-          - model_uncert: prefer low (close to 0)
-          - effort: prefer low (close to 0)
+          - Ambiguity = H(P(o|θ, mode)) at point θ = 1 - normalized_policy_uncert
+          - Risk = KL[P(o|θ, mode) || p(o|C)] (divergence from preferred observations)
 
         Args:
             features: Raw features dict with model_error, model_uncert, policy_uncert
@@ -596,19 +439,33 @@ class MetaGenerativeModel:
         # Normalize features
         norm_features = self.normalize_features(features)
 
-        # Construct prior Q(θ)
-        theta_prior = self._theta_prior(norm_features)
+        # Policy-uncertainty-based estimate (existing signal)
+        theta_pi = 1.0 - float(norm_features["normalized_policy_uncert"])
+        theta_pi = max(1e-6, min(1.0 - 1e-6, theta_pi))
 
-        # Ambiguity: expected entropy of likelihood
-        expected_entropy = self._expected_entropy(
-            self._theta_grid, theta_prior["weights"], norm_features
-        )
-        ambiguity = self.policy_ambiguity_weight * expected_entropy
+        # Extrinsic-value-based estimate: map (-1, 1) → (0, 1)
+        v_ext = float(norm_features["normalized_extrinsic_value"])
+        theta_v = (1.0 + v_ext) / 2.0
+        theta_v = max(1e-6, min(1.0 - 1e-6, theta_v))
 
-        # Risk: KL divergence from observation preferences
-        risk = self._compute_risk(
-            self._theta_grid, theta_prior["weights"], norm_features
-        )
+        # Model reliability: gate on extrinsic value signal
+        # When model is unreliable, we can't trust extrinsic value as evidence
+        # of policy quality (poor performance might be the model's fault)
+        model_uncert = float(norm_features["normalized_model_uncert"])
+        rho = 1.0 - min(1.0, model_uncert * self.model_ambiguity_weight)
+
+        # Composite estimate: interpolate from θ_π toward θ_v,
+        # weighted by extrinsic value weight and model reliability
+        w_effective = self.extrinsic_value_weight * rho
+        theta = theta_pi + w_effective * (theta_v - theta_pi)
+        theta = max(1e-6, min(1.0 - 1e-6, theta))
+
+        # Ambiguity: entropy of likelihood at point θ
+        entropy = self._compute_entropy(theta, norm_features)
+        ambiguity = self.policy_ambiguity_weight * entropy
+
+        # Risk: KL divergence from observation preferences at point θ
+        risk = self._compute_risk(theta, norm_features)
 
         # EFE scores: G = Ambiguity + Risk
         G = ambiguity + risk
@@ -616,13 +473,12 @@ class MetaGenerativeModel:
         # Debug info
         debug_info = {
             "normalized_features": norm_features,
-            "theta_prior": {
-                "mean": theta_prior["mean"],
-                "concentration": theta_prior["concentration"],
-                "alpha": theta_prior["alpha"],
-                "beta": theta_prior["beta"],
-            },
-            "expected_entropy": expected_entropy,
+            "theta": theta,
+            "theta_pi": theta_pi,
+            "theta_v": theta_v,
+            "model_reliability": rho,
+            "w_effective": w_effective,
+            "entropy": entropy,
             "ambiguity": ambiguity,
             "risk": risk,
         }
@@ -652,6 +508,22 @@ class MetaPlanningController:
         self.pref_policy_uncert_precision = float(config.get("pref_policy_uncert_precision", 1.0))
         self.pref_model_uncert_precision = float(config.get("pref_model_uncert_precision", 1.0))
         self.pref_effort_precision = float(config.get("pref_effort_precision", 1.0))
+
+        # Observation preference means
+        self.pref_extrinsic_mean = float(config.get("pref_extrinsic_mean", 1.0))
+        self.pref_policy_uncert_mean = float(config.get("pref_policy_uncert_mean", 0.0))
+        self.pref_model_uncert_mean = float(config.get("pref_model_uncert_mean", 0.0))
+        self.pref_effort_mean = float(config.get("pref_effort_mean", 0.0))
+
+        # Capacity exponent
+        self.capacity_exponent = float(config.get("capacity_exponent", 1.0))
+        self.variance_exponent = float(config.get("variance_exponent", 2.65))
+
+        # Weight on extrinsic value signal in composite θ estimate
+        self.extrinsic_value_weight = float(config.get("extrinsic_value_weight", 0.3))
+
+        # Include τ·σ² variance term in risk (full KL)
+        self.risk_include_variance = bool(config.get("risk_include_variance", False))
 
         # EMA betas for feature tracking
         self.error_ema_beta = float(config.get("error_ema_beta", 0.9))
@@ -688,12 +560,6 @@ class MetaPlanningController:
         # Pre-compute mode parameter arrays for vectorized scoring
         self._precompute_mode_arrays()
 
-        # Bayesian belief hyperparameters
-        self.initial_belief_alpha = float(config.get("initial_belief_alpha", 1.0))
-        self.initial_belief_beta = float(config.get("initial_belief_beta", 1.0))
-        self.observation_weight = float(config.get("observation_weight", 1.0))
-        self.belief_decay = float(config.get("belief_decay", 0.995))
-
         # Create explicit generative model for EFE computation
         self.generative_model = MetaGenerativeModel(
             policy_ambiguity_weight=self.policy_ambiguity_weight,
@@ -703,14 +569,18 @@ class MetaPlanningController:
             complexity=self._complexity,
             habit_deviation=self._habit_deviation,
             is_deterministic=self._is_deterministic,
-            initial_belief_alpha=self.initial_belief_alpha,
-            initial_belief_beta=self.initial_belief_beta,
-            observation_weight=self.observation_weight,
-            belief_decay=self.belief_decay,
             pref_extrinsic_precision=self.pref_extrinsic_precision,
             pref_policy_uncert_precision=self.pref_policy_uncert_precision,
             pref_model_uncert_precision=self.pref_model_uncert_precision,
             pref_effort_precision=self.pref_effort_precision,
+            pref_extrinsic_mean=self.pref_extrinsic_mean,
+            pref_policy_uncert_mean=self.pref_policy_uncert_mean,
+            pref_model_uncert_mean=self.pref_model_uncert_mean,
+            pref_effort_mean=self.pref_effort_mean,
+            capacity_exponent=self.capacity_exponent,
+            variance_exponent=self.variance_exponent,
+            extrinsic_value_weight=self.extrinsic_value_weight,
+            risk_include_variance=self.risk_include_variance,
         )
 
         # Initialize EMAs with pessimistic values (assume untrained model)
@@ -723,12 +593,11 @@ class MetaPlanningController:
         self.policy_uncert_ema: float = float(config.get("initial_policy_uncert", 1.0))
         self.extrinsic_value_ema: float = float(config.get("initial_extrinsic_value", 0.0))
 
-        # Tracking for extrinsic value improvement (computed between meta planning calls)
-        self._meta_period_initial_obs: Optional[np.ndarray] = None
-        self._meta_period_steps: int = 0
-
-        # Track last selected mode for Bayesian update (observations were generated under this mode)
-        self._last_mode_idx: int = 0  # Default to deterministic mode
+        # Per-episode extrinsic value tracking using AIF preference distance -E[ln p(o|C)].
+        # Records neg_extrinsic at episode start and current step to measure improvement.
+        self._episode_start_neg_extrinsic: Optional[float] = None
+        self._episode_current_neg_extrinsic: Optional[float] = None
+        self._extrinsic_value_fresh: bool = False  # True when new data recorded this episode
 
         # Warmup: force reactive mode until enough transitions collected
         self._transition_count = 0
@@ -927,17 +796,28 @@ class MetaPlanningController:
 
     def update_from_transition(self, obs_np: np.ndarray, action_np: np.ndarray, next_obs_np: np.ndarray) -> None:
         """Update model-error from a single transition (obs, action, next_obs).
-        Also tracks steps and initial observation for extrinsic value improvement computation.
+        Also tracks per-episode AIF extrinsic value improvement.
         """
         if not self.enabled:
             return
         self._transition_count += 1
 
-        # Track for extrinsic value improvement (initial obs → current obs per step)
-        if obs_np is not None:
-            if self._meta_period_initial_obs is None:
-                self._meta_period_initial_obs = obs_np.copy()
-            self._meta_period_steps += 1
+        # Track per-episode extrinsic value using AIF preference distance: -E[ln p(o|C)].
+        # Lower neg_extrinsic = closer to preferences = better.
+        if next_obs_np is not None and hasattr(self.agent, '_compute_neg_extrinsic_value'):
+            try:
+                with torch.no_grad():
+                    next_t = torch.as_tensor(next_obs_np, dtype=torch.float32, device=self.agent.device).unsqueeze(0)
+                    neg_ext = self.agent._compute_neg_extrinsic_value(next_t).mean().item()
+
+                    if self._episode_start_neg_extrinsic is None and obs_np is not None:
+                        start_t = torch.as_tensor(obs_np, dtype=torch.float32, device=self.agent.device).unsqueeze(0)
+                        self._episode_start_neg_extrinsic = self.agent._compute_neg_extrinsic_value(start_t).mean().item()
+
+                    self._episode_current_neg_extrinsic = neg_ext
+                    self._extrinsic_value_fresh = True
+            except Exception:
+                pass
 
         if self.agent is None:
             raise RuntimeError("MetaPlanningController.update_from_transition requires an agent.")
@@ -974,6 +854,11 @@ class MetaPlanningController:
         if error_val is not None:
             self.model_error_ema = _update_ema(self.model_error_ema, error_val, self.error_ema_beta)
 
+    def on_episode_reset(self) -> None:
+        """Reset per-episode extrinsic value tracking."""
+        self._episode_start_neg_extrinsic = None
+        self._episode_current_neg_extrinsic = None
+        self._extrinsic_value_fresh = False
 
     def compute_features(self, obs_np: np.ndarray, update_policy_uncert_ema: bool = True) -> Dict[str, Any]:
         """
@@ -1022,37 +907,25 @@ class MetaPlanningController:
                         self.model_uncert_ema, model_uncert, self.uncert_ema_beta
                     )
 
-            # Extrinsic value improvement: measures policy success as reduction in
-            # divergence from preferred state, normalized by number of steps.
-            # Positive values indicate improvement toward goals.
-            if self._meta_period_initial_obs is not None and self._meta_period_steps > 0:
-                try:
-                    initial_obs_t = torch.as_tensor(
-                        self._meta_period_initial_obs, dtype=torch.float32, device=self.agent.device
-                    ).unsqueeze(0)
-                    current_obs_t = torch.as_tensor(
-                        obs_np, dtype=torch.float32, device=self.agent.device
-                    ).unsqueeze(0)
-
-                    # neg_extrinsic is higher when further from preferences (worse)
-                    initial_neg_extrinsic = self.agent._compute_neg_extrinsic_value(initial_obs_t).mean().item()
-                    current_neg_extrinsic = self.agent._compute_neg_extrinsic_value(current_obs_t).mean().item()
-
-                    # Improvement = reduction in neg_extrinsic (initial - current), per step
-                    # Positive means we moved closer to preferred state
-                    extrinsic_value_improvement = (initial_neg_extrinsic - current_neg_extrinsic) / initial_neg_extrinsic
-                    self.extrinsic_value_ema = _update_ema(
-                        self.extrinsic_value_ema, extrinsic_value_improvement, self.extrinsic_value_ema_beta
-                    )
-                    print(f"[META][extrinsic] mid-episode: initial_neg={initial_neg_extrinsic:.4f} "
-                          f"current_neg={current_neg_extrinsic:.4f} steps={self._meta_period_steps} "
-                          f"improvement={extrinsic_value_improvement:.6f} ema={self.extrinsic_value_ema:.6f}")
-                except Exception:
-                    pass  # Keep previous EMA if computation fails
-
-            # Reset tracking for next meta planning period
-            self._meta_period_initial_obs = obs_np.copy() if obs_np is not None else None
-            self._meta_period_steps = 0
+            # Per-episode extrinsic value improvement: fractional reduction in
+            # -E[ln p(o|C)] from episode start to current step.
+            # Positive values indicate observations are moving closer to preferences.
+            if (self._extrinsic_value_fresh
+                    and self._episode_start_neg_extrinsic is not None
+                    and self._episode_current_neg_extrinsic is not None):
+                start_val = self._episode_start_neg_extrinsic
+                current_val = self._episode_current_neg_extrinsic
+                denom = max(abs(start_val), 1e-6)
+                extrinsic_value_improvement = math.tanh((start_val - current_val) / denom)
+                self.extrinsic_value_ema = _update_ema(
+                    self.extrinsic_value_ema, extrinsic_value_improvement, self.extrinsic_value_ema_beta
+                )
+                print(f"[META][extrinsic] episode_improvement={extrinsic_value_improvement:.6f} "
+                      f"start_neg_ext={start_val:.4f} "
+                      f"current_neg_ext={current_val:.4f} "
+                      f"ema={self.extrinsic_value_ema:.6f}")
+                # Consume the measurement so we don't update EMA again until a new transition arrives.
+                self._extrinsic_value_fresh = False
 
         # Use EMA for scoring; keep the raw measurement separate for optional updates/logging.
         policy_uncert_value = float(self.policy_uncert_ema)
@@ -1079,13 +952,6 @@ class MetaPlanningController:
 
         # Always compute features (policy EMA updates are gated by selected mode)
         features = self.compute_features(obs_np, update_policy_uncert_ema=False)
-
-        # Bayesian update of system quality belief based on observations
-        # Use the last selected mode since observations were generated under that mode
-        normalized_features = self.generative_model.normalize_features(features)
-        belief_update = self.generative_model.bayesian_update(
-            normalized_features, mode_idx=self._last_mode_idx
-        )
 
         policy_uncert_ema = features.get("policy_uncert_ema")
         if policy_uncert_ema is None:
@@ -1123,21 +989,25 @@ class MetaPlanningController:
         meta_risk = float(risk_values[idx]) if risk_values is not None else float(self._habit_deviation[idx])
 
         policy_uncert_measurement = features.get("policy_uncert_measurement")
-        if not deterministic and policy_uncert_measurement is not None:
+        if policy_uncert_measurement is not None:
             self.policy_uncert_ema = _update_ema(
                 self.policy_uncert_ema, policy_uncert_measurement, self.policy_uncert_ema_beta
             )
             policy_uncert_ema = float(self.policy_uncert_ema)
 
-        # Log features, belief state, and selected planning params
+        # Log features and selected planning params
+        theta = debug_info.get("theta", 0.5)
         print(f"[META] features: model_error={features.get('model_error', 0.0):.4f} "
               f"model_uncert={features.get('model_uncert', 0.0):.4f} "
               f"policy_uncert={policy_uncert_ema:.4f} "
               f"extrinsic_value={features.get('extrinsic_value', 0.0):.4f} | "
-              f"belief: mean={belief_update.get('belief_mean', 0.5):.3f} "
-              f"conc={belief_update.get('belief_concentration', 2.0):.1f} | "
+              f"theta={theta:.3f} (pi={debug_info.get('theta_pi', 0):.3f} "
+              f"v={debug_info.get('theta_v', 0):.3f} "
+              f"rho={debug_info.get('model_reliability', 0):.3f} "
+              f"w_eff={debug_info.get('w_effective', 0):.3f}) | "
               f"selected: H={mode.get('horizon')} N={mode.get('candidates')} "
-              f"M={mode.get('mc_models')} T={mode.get('mc_trajectories')} R={mode.get('action_rollouts')}")
+              f"M={mode.get('mc_models')} T={mode.get('mc_trajectories')} "
+              f"R={mode.get('action_rollouts')}")
 
         info = {
             "meta_mode_idx": int(idx),
@@ -1146,8 +1016,11 @@ class MetaPlanningController:
             "meta_model_uncert_ema": features.get("model_uncert", 0.0),
             "meta_policy_uncert_ema": policy_uncert_ema,
             "meta_extrinsic_value": features.get("extrinsic_value", 0.0),
-            "meta_belief_mean": belief_update.get("belief_mean", 0.5),
-            "meta_belief_concentration": belief_update.get("belief_concentration", 2.0),
+            "meta_theta": theta,
+            "meta_theta_pi": debug_info.get("theta_pi", 0.0),
+            "meta_theta_v": debug_info.get("theta_v", 0.0),
+            "meta_model_reliability": debug_info.get("model_reliability", 0.0),
+            "meta_w_effective": debug_info.get("w_effective", 0.0),
             "meta_risk": meta_risk,
             "meta_compute_cost_selected": float(costs[idx]),
             "meta_G_selected": float(scores[idx]),
@@ -1160,9 +1033,6 @@ class MetaPlanningController:
         }
         if mode.get("name") is not None:
             info["meta_mode_name"] = str(mode.get("name"))
-
-        # Track selected mode for next Bayesian update
-        self._last_mode_idx = idx
 
         return override, info
 
@@ -1191,8 +1061,8 @@ class MetaPlanningController:
           G(mode) = Ambiguity + Risk
 
         where:
-          - Ambiguity = E_Q(θ)[H(P(o|θ, mode))]
-          - Risk = KL[q(o|π) || p(o|C)] (cost/habit preferences)
+          - Ambiguity = H(P(o|θ, mode)) at point θ = 1 - normalized_policy_uncert
+          - Risk = KL[P(o|θ, mode) || p(o|C)] (cost/habit preferences)
 
         Key dynamics:
           - DETERMINISTIC mode: lower risk but higher ambiguity when policy quality is uncertain.

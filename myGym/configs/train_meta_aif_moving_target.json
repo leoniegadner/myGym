@@ -8,8 +8,7 @@
     "camera"    : 0,                   // Camera index / viewpoint
     "gui"       : 0,                   // 1 enables simulator GUI
     "visualize" : 0,                   // 1 enables additional visualizations
-    "visgym"    : 0,                   // 1 enables VisGym support
-
+    "visgym"    : 0,                   // 1 enables VisGym suppor
     // ---------------- Robot ----------------
     "robot"         : "nico_grasp",          // Robot model name
     "robot_action"  : "joints_gripper",      // Action representation
@@ -26,21 +25,20 @@
             "init": {"obj_name": "null"},
             "goal": {
                 "obj_name": "towertarget",
-                "fixed": 1,
+                "fixed": 0,
                 "rand_rot": 0,
-                "sampling_area": [0.1, 0.4, 0.25, 0.45, 0.1, 0.3]
+                "sampling_area": [-1.5, 1.5, 0.2, 1.5, 0.2, 0.2]
             }
         }
     ],
     "color_dict"   : {"apple": ["green"], "target": ["gray"]}, // Object color hints
     "used_objects" : {"num_range": [0, 0], "obj_list": []},    // Additional object config
 
-    // Observation layout: actual_state -> obj_xyz; goal_state -> obj_xyz; extra endeff_xyz
-    // actual_state = endeffector, goal_state = target, 
+    // Observation layout: actual_state -> obj_6D; goal_state -> obj_6D; extra endeff_xyz + moving_target_vel
     "observation" : {
-        "actual_state": "obj_xyz",
-        "goal_state": "obj_xyz",
-        "additional_obs": ["endeff_xyz"]
+        "actual_state": "obj_6D",
+        "goal_state": "obj_6D",
+        "additional_obs": ["endeff_xyz", "moving_target_vel"]
     },
 
     // ---------------- Distractors ----------------
@@ -52,6 +50,18 @@
         "movement_endpoints": [-0.3, 0.3, 0.4, 0.7, 0.1, 0.3] // Min/max per axis
     },
 
+    // ---------------- Moving Targets ----------------
+    "moving_target" : {
+        "list": ["towertarget"],
+        "moveable": 1,
+        "constant_speed": 1,
+        "movement_dims": 2,
+        "movement_endpoints": [-0.5, 0.5, -0.2, 0.6, 0.22, 0.22],
+        "reach_bounds": [-0.4, 0.4, 0.1, 0.5],
+        "speed_range": [0.06, 0.30],
+        "bind_goal": 1
+    },
+
     // ---------------- Reward/Perception ----------------
     "distance_type" : "euclidean",      // Distance metric for eval logging
     "vae_path"      : null,             // Optional VAE weights path
@@ -60,36 +70,31 @@
 
     // ---------------- Training loop ----------------
     "train_framework"   : "pytorch",    // Backend framework
-    "algo"              : "aif",        // Algorithm identifier
+    "algo"              : "meta_aif",   // Algorithm identifier
     "max_episode_steps" : 512,          // Env horizon
-    "steps"             : 1000000,      // Total training timesteps (synced with PETS)
+    "steps"             : 1500000,      // Total training timesteps
     "pretrained_model"  : null,         // Optional checkpoint path
     "multiprocessing"   : null,         // Optional multiprocessing config
 
     // ---------------- Active inference (AIF) ----------------
-    "aif_initial_random_steps"      : 4000,    // Steps of random actions before learning (synced with PETS)
-    "aif_model_update_freq"         : 512,     // World-model update frequency (synced with PETS mbrl_train_freq)
-    "aif_model_train_epochs"        : 20,      // Number of epochs to train world model per update (like PETS)
+    "aif_initial_random_steps"      : 0,    // Steps of random actions before learning
+    "aif_meta_recompute_freq"       : 512,      // Meta-controller recompute frequency (steps)
+    "aif_model_update_freq"         : 512,     // World-model update frequency: number (steps) or "meta_update" (before each meta recompute)
+    "aif_model_train_epochs"        : 15,      // Number of epochs to train world model per update (like PETS)
     "aif_policy_updates_per_step"   : 1,       // Policy updates per model update
-    "aif_batch_size"                : 128,     // Replay batch size (synced with PETS)
-    "aif_model_lr"                  : 0.001,   // World-model learning rate (synced with PETS)
-    "aif_model_wd"                  : 0.0001,  // World-model weight decay (synced with PETS)
-    "aif_logvar_reg_weight"         : 0.001,    // Logvar bounds regularizer weight (PETS-like)
+    "aif_batch_size"                : 64,      // Replay batch size
+    "aif_model_lr"                  : 0.0001,  // World-model learning rate (PETS-like)
+    "aif_model_wd"                  : 0.01,    // World-model weight decay (PETS-like)
+    "aif_logvar_reg_weight"         : 0.0,     // Logvar bounds regularizer weight (PETS-like)
     "aif_info_gain_weight"          : 0.1,     // Weight on info gain term in EFE
     "aif_replay_size"               : 100000,  // Replay buffer capacity
     "aif_gamma"                     : 1,       // Discount factor
     "aif_device"                    : "cpu",   // Torch device
-    "aif_log_freq"                  : 500,     // Logging frequency (steps)
+    "aif_log_freq"                  : 0,       // Logging frequency (steps) - 0 to disable
     "aif_log_vfe_terms"             : false,   // Log variational free energy terms
     "aif_log_efe_terms"             : true,    // Log expected free energy terms
-    "aif_plan_horizon"              : 10,      // Planning horizon H (synced with PETS)
-    "aif_optimisation_iters"        : 3,       // Simple CEM iterations (synced with PETS icem_num_iters)
-    "aif_plan_candidates"           : 100,     // Population size for planning (CEM/policy planner)
-    "aif_plan_elites"               : 10,      // Elite count for planning (CEM/policy planner)
     "aif_plan_recompute_freq"       : 1,       // Replanning frequency (steps)
-    "aif_mc_models"                 : 3,       // MC samples over dynamics models (synced with PETS ensemble_size)
-    "aif_mc_trajectories"           : 9,       // MC trajectories per model sample (synced with PETS mbrl_num_particles)
-    "aif_policy_mode"               : "icem",  // "cem"/"icem" use mbrl optimizers; "policy_net" uses amortized MPC; "simple_cem" uses legacy CEM
+    "aif_policy_mode"               : "policy_net",  // "cem"/"icem" use mbrl optimizers; "policy_net" uses amortized MPC; "simple_cem" uses legacy CEM
     "aif_policy_eval_mode"          : "plan",  // "plan" uses planning; "mean" uses policy_net mean (policy_net mode only)
     "fully_observable_mdp"          : true,    // Legacy flag; prefer aif_world_model.type
     "aif_drop_goal_from_state"      : false,   // Remove goal slice from the model state (goal used only for preferences)
@@ -107,35 +112,93 @@
     "aif_policy_elite_temperature"  : 0.5,     // Softmax temperature for elite weights (0 = uniform)
     "aif_policy_net_update_steps"   : 1,       // Gradient steps per planning call
     "aif_progress_bar"              : false,   // Show episode progress bars
+    "aif_policy_net_recompute_freq" : 2,       // MPC recompute frequency (steps)
     "aif_policy_kl_beta"            : 0.1,     // KL weight for Bayesian policy
     "aif_policy_posterior_mc_samples": 3,      // MC samples over policy posterior for distillation
     "aif_policy_efe_baseline_momentum": 0.9,   // EMA momentum for EFE baseline in single-sample updates
     "aif_policy_plan_action_rollouts":  3,     // Action-noise rollouts per policy sample when planning
+    // ---------------- Meta-AIF controller ----------------
+    "aif_meta_debug"              : true,
+    "aif_meta_enabled"            : true,      // Enable meta-planning controller
+    "aif_meta_selection"          : "greedy",  // "greedy" or "softmax"
+    "aif_meta_softmax_temp"       : 0.15,      // Softmax temperature for mode selection
+    "aif_meta_allow_deterministic": true,      // Allow deterministic (below-min) mode
+    "aif_meta_modes"              : null,      // Leave null to use min/max grid
+    // Mode grid ranges
+    "aif_meta_horizon_min"        : 2,
+    "aif_meta_horizon_max"        : 10,
+    "aif_meta_horizon_step"       : 2,
+    "aif_meta_candidates_min"     : 10,
+    "aif_meta_candidates_max"     : 90,
+    "aif_meta_candidates_step"    : 20,
+    "aif_meta_mc_models_min"      : 1,
+    "aif_meta_mc_models_max"      : 3,
+    "aif_meta_mc_models_step"     : 1,
+    "aif_meta_mc_trajectories_min": 2,
+    "aif_meta_mc_trajectories_max": 10,
+    "aif_meta_mc_trajectories_step": 2,
+    "aif_meta_action_rollouts_min": 1,
+    "aif_meta_action_rollouts_max": 5,
+    "aif_meta_action_rollouts_step": 1,
+    // EFE weights: G = Ambiguity + Risk
+    "aif_meta_cost_log"                : true, // Use log(1+cost) for complexity normalization
+    "aif_meta_policy_ambiguity_weight" : 5,    // Weight on ambiguity term (entropy of likelihood)
+    "aif_meta_model_ambiguity_weight"  : 1,    // Scales likelihood sharpness via model_uncert
+
+    // Observation preference precisions (higher = stronger preference)
+    "aif_meta_pref_extrinsic_precision"  : 1,  // Precision for extrinsic_value preference
+    "aif_meta_pref_policy_uncert_precision": 1,// Precision for policy_uncert preference
+    "aif_meta_pref_model_uncert_precision" : 1,// Precision for model_uncert preference
+    "aif_meta_pref_effort_precision"     : 1,  // Precision for effort preference
+    // Observation preference means (target values for each observation dimension)
+    "aif_meta_pref_extrinsic_mean"       : 0.9,  // Prefer high extrinsic value (goal achievement)
+    "aif_meta_pref_policy_uncert_mean"   : 0.0,  // Prefer low policy uncertainty
+    "aif_meta_pref_model_uncert_mean"    : 0.0,  // Prefer low model uncertainty
+    "aif_meta_pref_effort_mean"          : 0.0,  // Prefer low effort
+    "aif_meta_capacity_exponent"         : 0.3,  // Exponent on normalized capacity (<1 compresses, >1 amplifies)
+    "aif_meta_extrinsic_value_weight"    : 0.9,  // Weight on extrinsic value in composite θ (0 = policy uncert only)
+    "aif_meta_risk_include_variance"     : true, // Include τ·σ² variance term in risk (full KL divergence)
+    // EMA betas for feature tracking
+    "aif_meta_error_ema_beta"     : 0.9,
+    "aif_meta_uncert_ema_beta"    : 0.9,
+    "aif_meta_policy_uncert_ema_beta"    : 0.995,
+    "aif_meta_extrinsic_value_ema_beta"  : 0.995,
+    // Uncertainty estimation
+    "aif_meta_uncertainty_probe_actions" : 4,
+    "aif_meta_uncertainty_action_noise"  : 0.2,
+    "aif_meta_policy_uncertainty_samples": 4,
+    // Initial EMA values
+    "aif_meta_initial_model_error"   : 1.0,
+    "aif_meta_initial_model_uncert"  : 1.0,
+    "aif_meta_initial_policy_uncert" : 1.0,
+    "aif_meta_initial_extrinsic_value": 0.0,   // Initial extrinsic value (0 = neutral)
+    "aif_meta_warmup_transitions"    : 0,
     "aif_world_model"               : {        // World-model settings
         "type": "pets",                        // "vae" (default), "bayesian", or "pets"
-        "ensemble_size": 3,                    // Number of dynamics ensemble members (synced with PETS)
+        "ensemble_size": 3,                    // Number of dynamics ensemble members
         "hid_size": 64                         // Hidden size for dynamics nets
     },
     "aif_model_normalize"       : true,        // Normalize inputs for fully observable PETS/Bayesian dynamics
     "aif_tensorboard_log"       : true,        // Log AIF metrics to TensorBoard (logdir/aif_tb)
-    "aif_deterministic"         : false,       // Use deterministic dynamics model    
-    "aif_use_mse_loss"          : false,       // If true, use MSE loss; if false, use Gaussian NLL loss    
+    "aif_deterministic"         : false,       // Use deterministic dynamics model
+    "aif_use_mse_loss"          : false,       // If true, use MSE loss; if false, use Gaussian NLL loss
     "aif_loss_weight_kl_state"  : 1.0,         // Weight on KL divergence between encoder and dynamics
     "aif_loss_weight_nll_obs"   : 1.0,         // Weight on observation reconstruction loss
-    "aif_kl_theta_beta"         : 0.0,         // KL weight for prior over dynamics (acts as regularizer)
+    "aif_kl_theta_beta"         : 0.001,         // KL weight for prior over dynamics (acts as regularizer)
     "aif_info_gain_mode"        : "ensemble_var",// "logvar", "ensemble_var", or "both" info gain mode
-    
-    "aif_icem_population_decay_factor"  :1.25,  // synced with PETS
-    "aif_icem_keep_elite_frac"          :0.1,   // synced with PETS
+
+    "aif_icem_population_decay_factor"  :1.1,
+    "aif_icem_keep_elite_frac"          :0.2,
     "aif_icem_colored_noise_exponent"   :2.0,
-    "aif_icem_alpha"                    :0.1,   // synced with PETS
+    "aif_icem_alpha"                    :0.25,
     "aif_icem_return_mean_elites"       :true,
-    "aif_cem_clipped_normal"        :true,      // Use clipped normal distribution in CEM/ICEM 
+    "aif_cem_clipped_normal"        :true,      // Use clipped normal distribution in CEM/ICEM
 
 
     // ---------------- Evaluation ----------------
-    "eval_freq"     :15000,
-    "eval_episodes" :10,
+    "eval_freq"     : 15000,            // Evaluation interval (steps)
+    "eval_episodes" : 10,               // Episodes per evaluation
+
     // ---------------- Saving & logging ----------------
     "record"    : 0                    // 1 to record rollouts
 }

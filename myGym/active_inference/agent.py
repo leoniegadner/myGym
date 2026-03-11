@@ -33,6 +33,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import deque
 from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
@@ -1652,14 +1653,14 @@ class AIFAgent(nn.Module):
         Train policy_net to imitate the best action from planning rollouts.
 
         This is behavioral cloning from the planner: the policy learns to directly
-        output actions that the deliberative planner would choose. High-compute plans
-        (which explore more thoroughly) update the policy more strongly.
+        output actions that the deliberative planner would choose. Episodes with
+        high extrinsic value (good performance) update the policy more strongly.
 
         Args:
             obs_np: Current observation [obs_dim]
             planned_action: Best first action from planning rollouts [action_dim]
-            compute_weight: Scaling factor proportional to planning complexity.
-                High-compute plans → stronger update; deterministic (weight=0) → skip.
+            compute_weight: Scaling factor from extrinsic value (episode performance).
+                High extrinsic value → stronger update; deterministic (weight=0) → skip.
         """
         if compute_weight <= 0.0:
             return None  # Skip for deterministic mode
@@ -1686,7 +1687,7 @@ class AIFAgent(nn.Module):
             target_action, mean, std, self.action_low, self.action_high
         )
 
-        # Scale loss by compute_weight: high-compute plans → stronger habituation
+        # Scale loss by compute_weight: high extrinsic value → stronger habituation
         loss = -compute_weight * log_prob.mean()  # Negative because we maximize log prob
         loss = loss + compute_weight * self.policy_kl_beta * self.policy_net.kl_loss()
         loss = loss + compute_weight * self._policy_std_penalty()
@@ -1714,9 +1715,9 @@ class AIFAgent(nn.Module):
         replay is avoided.
 
         Args:
-            compute_weight: Scaling factor for the policy update, proportional to planning
-                compute cost. High-compute plans update policy more strongly (habituating
-                deliberative actions); deterministic plans (weight=0) skip the update.
+            compute_weight: Scaling factor for the policy update, based on extrinsic value
+                (episode performance). High extrinsic value updates policy more strongly
+                (habituating successful actions); deterministic mode (weight=0) skips the update.
         """
         if compute_weight <= 0.0:
             return None  # Skip update for deterministic/zero-compute plans
@@ -1830,8 +1831,8 @@ class AIFAgent(nn.Module):
                 + (1.0 - self._policy_efe_baseline_momentum) * efe_detached.mean()
             )
         adv = (efe - self._policy_efe_baseline).detach()
-        # Scale loss by compute_weight: high-compute plans → stronger policy update
-        # This habituates deliberative actions more than reactive ones
+        # Scale loss by compute_weight: high extrinsic value → stronger policy update
+        # This habituates successful actions more than unsuccessful ones
         loss = compute_weight * (adv * log_prob).mean()
         loss = loss + compute_weight * self.policy_kl_beta * self.policy_net.kl_loss()
         loss = loss + compute_weight * self._policy_std_penalty()
@@ -2113,12 +2114,11 @@ class AIFAgent(nn.Module):
                         )
 
                 # Train policy to imitate the planned best action (behavioral cloning from planner)
-                # Compute weight proportional to planning complexity (normalized)
+                # Weight by extrinsic value (episode performance); disabled for deterministic mode
                 compute_weight = 0.0
                 if meta_info and self._meta_controller is not None:
-                    meta_cost = float(meta_info.get("meta_compute_cost_selected", 0.0))
-                    max_cost = self._meta_controller.max_complexity
-                    compute_weight = meta_cost / max(max_cost, 1e-6)
+                    if not meta_info.get("meta_deterministic", False):
+                        compute_weight = max(0.0, float(meta_info.get("meta_extrinsic_value", 0.0)))
                 if compute_weight > 0.0:
                     self._last_policy_bc_info = self.update_policy_from_planned_action(
                         obs_np, a0, compute_weight=compute_weight
@@ -2867,8 +2867,7 @@ class AIFAgent(nn.Module):
 
         # Reset meta controller's episode-specific tracking to prevent cross-episode contamination
         if self._meta_controller is not None:
-            self._meta_controller._meta_period_initial_obs = None
-            self._meta_controller._meta_period_steps = 0
+            self._meta_controller.on_episode_reset()
 
     def update_meta_stats(self, obs_np: np.ndarray, action_np: np.ndarray, next_obs_np: np.ndarray) -> None:
         if self._meta_controller is None or not getattr(self._meta_controller, "enabled", False):
@@ -2967,6 +2966,8 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_meta_error_ema_beta", 0.9)
         self.arg_dict.setdefault("aif_meta_uncert_ema_beta", 0.9)
         self.arg_dict.setdefault("aif_meta_policy_uncert_ema_beta", 0.9)
+        self.arg_dict.setdefault("aif_meta_extrinsic_value_weight", 0.3)
+        self.arg_dict.setdefault("aif_meta_risk_include_variance", False)
         self.arg_dict.setdefault("aif_meta_uncertainty_probe_actions", 3)
         self.arg_dict.setdefault("aif_meta_uncertainty_action_noise", 0.1)
         self.arg_dict.setdefault("aif_meta_policy_uncertainty_samples", None)
@@ -3091,6 +3092,15 @@ class ActiveInferenceSB3:
             "pref_policy_uncert_precision": self.arg_dict.get("aif_meta_pref_policy_uncert_precision", 1.0),
             "pref_model_uncert_precision": self.arg_dict.get("aif_meta_pref_model_uncert_precision", 1.0),
             "pref_effort_precision": self.arg_dict.get("aif_meta_pref_effort_precision", 1.0),
+            # Observation preference means
+            "pref_extrinsic_mean": self.arg_dict.get("aif_meta_pref_extrinsic_mean", 1.0),
+            "pref_policy_uncert_mean": self.arg_dict.get("aif_meta_pref_policy_uncert_mean", 0.0),
+            "pref_model_uncert_mean": self.arg_dict.get("aif_meta_pref_model_uncert_mean", 0.0),
+            "pref_effort_mean": self.arg_dict.get("aif_meta_pref_effort_mean", 0.0),
+            "capacity_exponent": self.arg_dict.get("aif_meta_capacity_exponent", 1.0),
+            "variance_exponent": self.arg_dict.get("aif_meta_variance_exponent", 2.65),
+            "extrinsic_value_weight": self.arg_dict.get("aif_meta_extrinsic_value_weight", 0.3),
+            "risk_include_variance": bool(self.arg_dict.get("aif_meta_risk_include_variance", False)),
             "error_ema_beta": self.arg_dict.get("aif_meta_error_ema_beta", 0.9),
             "uncert_ema_beta": self.arg_dict.get("aif_meta_uncert_ema_beta", 0.9),
             "policy_uncert_ema_beta": self.arg_dict.get("aif_meta_policy_uncert_ema_beta", 0.9),
@@ -3106,6 +3116,8 @@ class ActiveInferenceSB3:
             "initial_model_error": self.arg_dict.get("aif_meta_initial_model_error", 2.0),
             "initial_model_uncert": self.arg_dict.get("aif_meta_initial_model_uncert", 1.0),
             "initial_policy_uncert": self.arg_dict.get("aif_meta_initial_policy_uncert", 1.0),
+            "initial_extrinsic_value": self.arg_dict.get("aif_meta_initial_extrinsic_value", 0.0),
+            "dimension_velocity": float(self.arg_dict.get("dimension_velocity", 0.05)),
         }
 
         obs_dim = self._infer_obs_dim(self.observation_space)
@@ -3499,7 +3511,7 @@ class ActiveInferenceSB3:
         return obs
 
     def _update_final_extrinsic_value(self, final_obs_np: np.ndarray) -> None:
-        """Update extrinsic value EMA with terminal observation before episode reset.
+        """Update extrinsic value EMA with per-episode AIF preference improvement before episode reset.
 
         This ensures successful episodes (which may end before the next meta recompute)
         contribute their improvement signal to the EMA.
@@ -3507,43 +3519,29 @@ class ActiveInferenceSB3:
         meta_ctrl = getattr(self.agent, "_meta_controller", None)
         if meta_ctrl is None or not getattr(meta_ctrl, "enabled", False):
             return
-        if meta_ctrl._meta_period_initial_obs is None or meta_ctrl._meta_period_steps <= 0:
+        if meta_ctrl._episode_start_neg_extrinsic is None:
             return
 
         try:
-            initial_obs_t = torch.as_tensor(
-                meta_ctrl._meta_period_initial_obs,
-                dtype=torch.float32,
-                device=self.agent.device
-            ).unsqueeze(0)
-            final_obs_t = torch.as_tensor(
-                final_obs_np,
-                dtype=torch.float32,
-                device=self.agent.device
-            ).unsqueeze(0)
-
             with torch.no_grad():
-                initial_neg_extrinsic = self.agent._compute_neg_extrinsic_value(initial_obs_t).mean().item()
-                final_neg_extrinsic = self.agent._compute_neg_extrinsic_value(final_obs_t).mean().item()
+                obs_t = torch.as_tensor(
+                    final_obs_np, dtype=torch.float32, device=self.agent.device
+                ).unsqueeze(0)
+                final_neg_ext = self.agent._compute_neg_extrinsic_value(obs_t).mean().item()
 
-            # Improvement = reduction in neg_extrinsic (initial - final), per step
+            start_val = meta_ctrl._episode_start_neg_extrinsic
+            denom = max(abs(start_val), 1e-6)
+            improvement = math.tanh((start_val - final_neg_ext) / denom)
 
-            # Normalized:
-            # this is equivalent per_step_extrinsic / max_possible_per_step
-            improvement = (initial_neg_extrinsic - final_neg_extrinsic) / initial_neg_extrinsic if abs(initial_neg_extrinsic) > 0 else 0.0
-            steps = meta_ctrl._meta_period_steps
+            # Update EMA via shared helper
+            from myGym.active_inference.meta_planning import _update_ema
+            meta_ctrl.extrinsic_value_ema = _update_ema(
+                meta_ctrl.extrinsic_value_ema, improvement, meta_ctrl.extrinsic_value_ema_beta
+            )
 
-            # Update EMA
-            beta = meta_ctrl.extrinsic_value_ema_beta
-            meta_ctrl.extrinsic_value_ema = beta * meta_ctrl.extrinsic_value_ema + (1 - beta) * improvement
-
-            print(f"[META][extrinsic] terminal: initial_neg={initial_neg_extrinsic:.4f} "
-                  f"final_neg={final_neg_extrinsic:.4f} steps={steps} "
-                  f"improvement={improvement:.6f} ema={meta_ctrl.extrinsic_value_ema:.6f}")
-
-            # Reset tracking (will also be done in reset_planner_state, but be explicit)
-            meta_ctrl._meta_period_initial_obs = None
-            meta_ctrl._meta_period_steps = 0
+            print(f"[META][extrinsic] terminal: episode_improvement={improvement:.6f} "
+                  f"start_neg_ext={start_val:.4f} final_neg_ext={final_neg_ext:.4f} "
+                  f"ema={meta_ctrl.extrinsic_value_ema:.6f}")
 
         except Exception:
             pass  # Fail silently if computation fails
@@ -3639,6 +3637,8 @@ class ActiveInferenceSB3:
         callback = self._setup_callback(callback)
         if callback is not None and hasattr(callback, "on_training_start"):
             callback.on_training_start(locals(), globals())
+
+        self._training_start_time = time.time()
 
         obs = self._reset_env()
         episode_step = 0
@@ -3743,7 +3743,6 @@ class ActiveInferenceSB3:
                         if vfe_parts:
                             print(f"[AIF] step {self.num_timesteps} vfe: " + ", ".join(vfe_parts))
                     self._latest_update_info = last_info
-
             if is_random_step:
                 action = self.action_space.sample()
             else:
@@ -3809,20 +3808,17 @@ class ActiveInferenceSB3:
                         )
                     if pol_info and self.arg_dict.get("aif_log_efe_terms", False):
                         log_info.update({f"{k}": v for k, v in pol_info.items()})
-
+            
             # Optional policy_net updates using real transitions scored by EFE
-            # Compute weight: proportional to planning cost (high-compute → stronger update)
+            # Weight by extrinsic value (episode performance); disabled for deterministic mode
             real_efe_freq = int(self.arg_dict.get("aif_policy_real_efe_freq", 0) or 0)
             real_efe_updates = int(self.arg_dict.get("aif_policy_real_efe_updates", 1) or 1)
             real_info = None
             if real_efe_freq > 0 and self.num_timesteps >= self.initial_random_steps and self.num_timesteps % real_efe_freq == 0:
-                # Compute normalized weight from meta planning cost
+                # Weight by extrinsic value EMA from meta-planning (episode improvement)
                 compute_weight = 0.0
                 if current_meta_info and not is_deterministic_mode:
-                    meta_cost = float(current_meta_info.get("meta_compute_cost_selected", 0.0))
-                    meta_ctrl = getattr(self.agent, "meta_controller", None)
-                    max_cost = meta_ctrl.max_complexity if meta_ctrl else 1.0
-                    compute_weight = meta_cost / max(max_cost, 1e-6)
+                    compute_weight = max(0.0, float(current_meta_info.get("meta_extrinsic_value", 0.0)))
                 for _ in range(real_efe_updates):
                     real_info = self.agent.update_policy_with_real_efe(
                         obs_np=self._last_onpolicy_obs,
@@ -3864,6 +3860,9 @@ class ActiveInferenceSB3:
                     # Meta-risk is pre-computed per mode.
                 if log_info:
                     tb_metrics = {f"aif/{k}": v for k, v in log_info.items()}
+                    elapsed = time.time() - self._training_start_time
+                    if elapsed > 0:
+                        tb_metrics["time/fps"] = self.num_timesteps / elapsed
                     self._log_tb_metrics(tb_metrics, self.num_timesteps)
                 if log_info:
                     print(f"[AIF] step {self.num_timesteps}: {log_info}")
@@ -3932,6 +3931,9 @@ class ActiveInferenceSB3:
         return self
 
     def predict(self, observation, deterministic: bool = False):
+        # Before any model training, use random actions (like PETS)
+        if self.num_timesteps < self.initial_random_steps:
+            return self.action_space.sample(), None
         obs_vec, pref_vec, pref_mask = self._flatten_obs_with_pref(observation)
         if pref_vec is not None:
             self.agent.set_preference_mean(pref_vec, pref_mask)

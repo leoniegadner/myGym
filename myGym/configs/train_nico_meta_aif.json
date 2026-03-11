@@ -15,7 +15,7 @@
     "robot_init"    : [0.5, 0.2, 0.4],       // Initial EE pose (xyz)
     "max_velocity"  : 3,                     // Joint/EE velocity limit
     "max_force"     : 200,                   // Force/torque limit
-    "action_repeat" : 1,                     // Repeat each action this many steps
+    "action_repeat" : 2,                     // Repeat each action this many steps
 
     // ---------------- Task ----------------
     "task_type"        : "A",                // Scenario/task identifier
@@ -61,14 +61,14 @@
     "train_framework"   : "pytorch",    // Backend framework
     "algo"              : "meta_aif",   // Algorithm identifier
     "max_episode_steps" : 512,          // Env horizon
-    "steps"             : 1500000,      // Total training timesteps
+    "steps"             : 1000000,      // Total training timesteps
     "pretrained_model"  : null,         // Optional checkpoint path
     "multiprocessing"   : null,         // Optional multiprocessing config
 
     // ---------------- Active inference (AIF) ----------------
-    "aif_initial_random_steps"      : 0,    // Steps of random actions before learning
-    "aif_meta_recompute_freq"       : 250,      // Meta-controller recompute frequency (steps)
-    "aif_model_update_freq"         : "meta_update",     // World-model update frequency: number (steps) or "meta_update" (before each meta recompute)
+    "aif_initial_random_steps"      : 0,        // Steps of random actions before learning
+    "aif_meta_recompute_freq"       : 512,      // Meta-controller recompute frequency (steps)
+    "aif_model_update_freq"         : "meta_update",  // World-model update frequency: number (steps) or "meta_update" (before each meta recompute)
     "aif_model_train_epochs"        : 15,      // Number of epochs to train world model per update (like PETS)
     "aif_policy_updates_per_step"   : 1,       // Policy updates per model update
     "aif_batch_size"                : 64,      // Replay batch size
@@ -110,12 +110,12 @@
     "aif_meta_debug"              : true,
     "aif_meta_enabled"            : true,      // Enable meta-planning controller
     "aif_meta_selection"          : "greedy",  // "greedy" or "softmax"
-    "aif_meta_softmax_temp"       : 1.0,       // Softmax temperature for mode selection
+    "aif_meta_softmax_temp"       : 0.15,      // Softmax temperature for mode selection
     "aif_meta_allow_deterministic": true,      // Allow deterministic (below-min) mode
     "aif_meta_modes"              : null,      // Leave null to use min/max grid
     // Mode grid ranges
     "aif_meta_horizon_min"        : 2,
-    "aif_meta_horizon_max"        : 12,
+    "aif_meta_horizon_max"        : 10,
     "aif_meta_horizon_step"       : 2,
     "aif_meta_candidates_min"     : 10,
     "aif_meta_candidates_max"     : 90,
@@ -127,40 +127,44 @@
     "aif_meta_mc_trajectories_max": 10,
     "aif_meta_mc_trajectories_step": 2,
     "aif_meta_action_rollouts_min": 1,
-    "aif_meta_action_rollouts_max": 8,
-    "aif_meta_action_rollouts_step": 2,
+    "aif_meta_action_rollouts_max": 5,
+    "aif_meta_action_rollouts_step": 1,
     // EFE weights: G = Ambiguity + Risk
     // Ambiguity = E_Q(θ)[H(P(o|θ, mode))] - uncertainty about outcomes
     // Risk = KL[q(o|mode) || p(o|C)] - divergence from preferred observations
-    "aif_meta_cost_log"                : false,   // Use log(1+cost) for complexity normalization
-    "aif_meta_policy_ambiguity_weight" : 3,    // Weight on ambiguity term (entropy of likelihood)
-    "aif_meta_model_ambiguity_weight"  : 10,    // Scales likelihood sharpness via model_uncert
+    "aif_meta_cost_log"                : true, // Use log(1+cost) for complexity normalization
+    "aif_meta_policy_ambiguity_weight" : 6,    // Weight on ambiguity term (entropy of likelihood)
+    "aif_meta_model_ambiguity_weight"  : 1,    // Scales likelihood sharpness via model_uncert
 
     // Observation preference precisions (higher = stronger preference)
     // Risk = KL[q(o|mode) || p(o|C)] where p(o|C) ~ N(μ_pref, 1/precision)
-    "aif_meta_pref_extrinsic_precision"  : 1.0,  // Precision for extrinsic_value preference (μ=1, prefer high)
-    "aif_meta_pref_policy_uncert_precision": 1.0,// Precision for policy_uncert preference (μ=0, prefer low)
-    "aif_meta_pref_model_uncert_precision" : 1.0,// Precision for model_uncert preference (μ=0, prefer low)
-    "aif_meta_pref_effort_precision"     : 2,  // Precision for effort preference (μ=0, prefer low cost)
+    "aif_meta_pref_extrinsic_precision"  : 1,  // Precision for extrinsic_value preference
+    "aif_meta_pref_policy_uncert_precision": 1,// Precision for policy_uncert preference
+    "aif_meta_pref_model_uncert_precision" : 1,// Precision for model_uncert preference
+    "aif_meta_pref_effort_precision"     : 1,  // Precision for effort preference
+    // Observation preference means (target values for each observation dimension)
+    "aif_meta_pref_extrinsic_mean"       : 0.9,  // Prefer high extrinsic value (goal achievement)
+    "aif_meta_pref_policy_uncert_mean"   : 0.0,  // Prefer low policy uncertainty (confident policy)
+    "aif_meta_pref_model_uncert_mean"    : 0.0,  // Prefer low model uncertainty (reliable model)
+    "aif_meta_pref_effort_mean"          : 0.0,  // Prefer low effort (computational efficiency)
+    "aif_meta_capacity_exponent"         : 0.6,  // Exponent on normalized capacity (<1 compresses, >1 amplifies)
+    "aif_meta_extrinsic_value_weight"    : 0.5,  // Weight on extrinsic value in composite θ (0 = policy uncert only)
+    "aif_meta_risk_include_variance"     : true, // Include τ·σ² variance term in risk (full KL divergence)
     // EMA betas for feature tracking
-    "aif_meta_error_ema_beta"     : 0.9,
-    "aif_meta_uncert_ema_beta"    : 0.9,
-    "aif_meta_policy_uncert_ema_beta"    : 0.999,
-    "aif_meta_extrinsic_value_ema_beta"  : 0.999,
+    "aif_meta_error_ema_beta"     : 0.8,
+    "aif_meta_uncert_ema_beta"    : 0.8,
+    "aif_meta_policy_uncert_ema_beta"    : 0.995,
+    "aif_meta_extrinsic_value_ema_beta"  : 0.995,
     // Uncertainty estimation
     "aif_meta_uncertainty_probe_actions" : 4,
     "aif_meta_uncertainty_action_noise"  : 0.2,
     "aif_meta_policy_uncertainty_samples": 4,
+    "aif_meta_variance_exponent"         : 2, // Exponent on variance term in risk computation
     // Initial EMA values
     "aif_meta_initial_model_error"   : 1.0,
     "aif_meta_initial_model_uncert"  : 1.0,
     "aif_meta_initial_policy_uncert" : 1.0,
     "aif_meta_initial_extrinsic_value": 0.0,   // Initial extrinsic value (0 = neutral)
-    // Bayesian belief over policy quality θ ~ Beta(α, β)
-    "aif_meta_initial_belief_alpha"  : 1.0,    // Initial α (1.0 = uniform prior)
-    "aif_meta_initial_belief_beta"   : 1.0,    // Initial β (1.0 = uniform prior)
-    "aif_meta_observation_weight"    : 1.0,    // Observation precision weight (higher = faster updates)
-    "aif_meta_belief_decay"          : 0.995,  // Belief decay toward uniform (1.0 = no decay)
     "aif_meta_warmup_transitions"    : 0,
     "aif_world_model"               : {        // World-model settings
         "type": "pets",                        // "vae" (default), "bayesian", or "pets"

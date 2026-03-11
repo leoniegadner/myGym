@@ -54,14 +54,14 @@
     #Train
     "train_framework"   :"pytorch",
     "algo"              :"ppo",
-    "max_episode_steps" :1000,
-    "steps"             :100000,
+    "max_episode_steps" :512,
+    "steps"             :1500000,
     // test pretrained: "/Users/Leonie/Desktop/Robot_Nico_Project/Project/myGym/myGym/trained_models/nico_grasp/A/joints_gripper_ppo"
     "pretrained_model"  :null,
     "multiprocessing"   :null,
     #Evaluation
-    "eval_freq"     :500000,
-    "eval_episodes" :50,
+    "eval_freq"     :15000,
+    "eval_episodes" :10,
     #Saving and logging
     "record"    :0
     }

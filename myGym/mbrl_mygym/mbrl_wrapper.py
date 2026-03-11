@@ -226,6 +226,18 @@ class MBRLWrapper:
             "best_val_score": _to_float(best_val_score),
         }
 
+    def _moving_target_vel_dim(self):
+        """Compute dimension of the moving_target_vel observation from config."""
+        mt_cfg = self.arg_dict.get("moving_target") or {}
+        if not mt_cfg.get("list"):
+            return 0
+        if mt_cfg.get("bind_goal", 0):
+            n_targets = 1
+        else:
+            n_targets = len(mt_cfg.get("list", []))
+        k = 3 if mt_cfg.get("movement_dims", 2) == 3 else 2
+        return n_targets * k
+
     def _build_obs_parser(self):
         """Creates a parser that converts flattened observations back to the env-style dict."""
         obs_cfg = self.arg_dict.get("observation", {}) or {}
@@ -234,7 +246,12 @@ class MBRLWrapper:
         additional_keys = obs_cfg.get("additional_obs") or []
 
         # Minimal length map matching flatten_obs order: actual -> goal -> additional_obs (in list order).
-        length_map = {"obj_xyz": 3, "obj_6D": 7, "endeff_xyz": 3, "endeff_6D": 7}
+        length_map = {
+            "obj_xyz": 3, "obj_6D": 7,
+            "endeff_xyz": 3, "endeff_6D": 7,
+            "distractor": 3, "touch": 1,
+            "moving_target_vel": self._moving_target_vel_dim(),
+        }
         try:
             actual_len = length_map[actual_key]
             goal_len = length_map[goal_key]
@@ -403,7 +420,9 @@ class MBRLWrapper:
                         self.mimic_train_stats = json.load(f)
                 except Exception:
                     self.mimic_train_stats = {}
-        except Exception:
+        except Exception as e:
+            print(f"[MBRL] WARNING: Failed to load policy mimic from {mimic_path}: {e}")
+            import traceback; traceback.print_exc()
             self.policy_mimic = None
 
     def _restore_trained_components(self, load_dir=None):
@@ -526,9 +545,14 @@ class MBRLWrapper:
 
                 def step(self, action):
                     import numpy as np
-                    # DummyVecEnv expects actions with shape (n_envs, action_dim)
-                    # MBRL may pass (action_dim,), so reshape if needed
-                    action = np.atleast_2d(action)
+                    from stable_baselines3.common.vec_env import VecEnv
+                    action = np.asarray(action)
+                    # Only add a batch dimension when the inner env is a VecEnv;
+                    # regular Gym envs expect a flat 1-D action.
+                    if isinstance(self.env, VecEnv):
+                        action = np.atleast_2d(action)
+                    elif action.ndim > 1:
+                        action = action.squeeze(0)
                     result = self.env.step(action)
                     # Handle both old Gym API (4 values) and new Gymnasium API (5 values)
                     if len(result) == 4:

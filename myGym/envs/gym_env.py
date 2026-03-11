@@ -406,6 +406,7 @@ class GymEnv(CameraEnv):
         """
         #super().reset(seed=seed)
         if not only_subtask:
+            self.robot.release_all_objects()
             self.robot.reset(random_robot=random_robot)
             super().reset(hard=hard)
 
