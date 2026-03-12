@@ -139,13 +139,9 @@
     // Observation preference precisions (higher = stronger preference)
     // Risk = KL[q(o|mode) || p(o|C)] where p(o|C) ~ N(μ_pref, 1/precision)
     "aif_meta_pref_extrinsic_precision"  : 1,  // Precision for extrinsic_value preference
-    "aif_meta_pref_policy_uncert_precision": 1,// Precision for policy_uncert preference
-    "aif_meta_pref_model_uncert_precision" : 1,// Precision for model_uncert preference
     "aif_meta_pref_effort_precision"     : 1,  // Precision for effort preference
     // Observation preference means (target values for each observation dimension)
     "aif_meta_pref_extrinsic_mean"       : 0.9,  // Prefer high extrinsic value (goal achievement)
-    "aif_meta_pref_policy_uncert_mean"   : 0.0,  // Prefer low policy uncertainty (confident policy)
-    "aif_meta_pref_model_uncert_mean"    : 0.0,  // Prefer low model uncertainty (reliable model)
     "aif_meta_pref_effort_mean"          : 0.0,  // Prefer low effort (computational efficiency)
     "aif_meta_capacity_exponent"         : 0.6,  // Exponent on normalized capacity (<1 compresses, >1 amplifies)
     "aif_meta_extrinsic_value_weight"    : 0.5,  // Weight on extrinsic value in composite θ (0 = policy uncert only)
@@ -160,6 +156,8 @@
     "aif_meta_uncertainty_action_noise"  : 0.2,
     "aif_meta_policy_uncertainty_samples": 4,
     "aif_meta_variance_exponent"         : 2, // Exponent on variance term in risk computation
+    "aif_meta_planning_variance_reduction_factor": 0.8, // Factor for planning variance reduction (0-1)
+    "aif_meta_planning_noise_factor"             : 1.0, // Noise scaling from model unreliability
     // Initial EMA values
     "aif_meta_initial_model_error"   : 1.0,
     "aif_meta_initial_model_uncert"  : 1.0,

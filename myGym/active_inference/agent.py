@@ -2953,15 +2953,12 @@ class ActiveInferenceSB3:
         self.arg_dict.setdefault("aif_meta_allow_deterministic", False)
         self.arg_dict.setdefault("aif_meta_mode_count", 3)
         self.arg_dict.setdefault("aif_meta_modes", None)
-        self.arg_dict.setdefault("aif_meta_max_modes", None)
         self.arg_dict.setdefault("aif_meta_recompute_freq", 1)
         self.arg_dict.setdefault("aif_meta_cost_log", True)
         self.arg_dict.setdefault("aif_meta_policy_ambiguity_weight", 1.0)
         self.arg_dict.setdefault("aif_meta_model_ambiguity_weight", 1.0)
         # Observation preference precisions
         self.arg_dict.setdefault("aif_meta_pref_extrinsic_precision", 1.0)
-        self.arg_dict.setdefault("aif_meta_pref_policy_uncert_precision", 1.0)
-        self.arg_dict.setdefault("aif_meta_pref_model_uncert_precision", 1.0)
         self.arg_dict.setdefault("aif_meta_pref_effort_precision", 1.0)
         self.arg_dict.setdefault("aif_meta_error_ema_beta", 0.9)
         self.arg_dict.setdefault("aif_meta_uncert_ema_beta", 0.9)
@@ -3063,7 +3060,6 @@ class ActiveInferenceSB3:
             "allow_deterministic": bool(self.arg_dict.get("aif_meta_allow_deterministic", False)),
             "mode_count": self.arg_dict.get("aif_meta_mode_count", 3),
             "modes": self.arg_dict.get("aif_meta_modes"),
-            "max_modes": self.arg_dict.get("aif_meta_max_modes"),
             "recompute_freq": self.arg_dict.get("aif_meta_recompute_freq", 1),
             "horizon_min": self.arg_dict.get("aif_meta_horizon_min", self.arg_dict.get("aif_plan_horizon", 20)),
             "horizon_max": self.arg_dict.get("aif_meta_horizon_max", self.arg_dict.get("aif_plan_horizon", 20)),
@@ -3089,16 +3085,14 @@ class ActiveInferenceSB3:
             "model_ambiguity_weight": self.arg_dict.get("aif_meta_model_ambiguity_weight", 1.0),
             # Observation preference precisions
             "pref_extrinsic_precision": self.arg_dict.get("aif_meta_pref_extrinsic_precision", 1.0),
-            "pref_policy_uncert_precision": self.arg_dict.get("aif_meta_pref_policy_uncert_precision", 1.0),
-            "pref_model_uncert_precision": self.arg_dict.get("aif_meta_pref_model_uncert_precision", 1.0),
             "pref_effort_precision": self.arg_dict.get("aif_meta_pref_effort_precision", 1.0),
             # Observation preference means
             "pref_extrinsic_mean": self.arg_dict.get("aif_meta_pref_extrinsic_mean", 1.0),
-            "pref_policy_uncert_mean": self.arg_dict.get("aif_meta_pref_policy_uncert_mean", 0.0),
-            "pref_model_uncert_mean": self.arg_dict.get("aif_meta_pref_model_uncert_mean", 0.0),
             "pref_effort_mean": self.arg_dict.get("aif_meta_pref_effort_mean", 0.0),
             "capacity_exponent": self.arg_dict.get("aif_meta_capacity_exponent", 1.0),
             "variance_exponent": self.arg_dict.get("aif_meta_variance_exponent", 2.65),
+            "planning_variance_reduction_factor": self.arg_dict.get("aif_meta_planning_variance_reduction_factor", 0.8),
+            "planning_noise_factor": self.arg_dict.get("aif_meta_planning_noise_factor", 1.0),
             "extrinsic_value_weight": self.arg_dict.get("aif_meta_extrinsic_value_weight", 0.3),
             "risk_include_variance": bool(self.arg_dict.get("aif_meta_risk_include_variance", False)),
             "error_ema_beta": self.arg_dict.get("aif_meta_error_ema_beta", 0.9),

@@ -147,15 +147,13 @@
 
     // Observation preference precisions (higher = stronger preference)
     "aif_meta_pref_extrinsic_precision"  : 1,  // Precision for extrinsic_value preference
-    "aif_meta_pref_policy_uncert_precision": 1,// Precision for policy_uncert preference
-    "aif_meta_pref_model_uncert_precision" : 1,// Precision for model_uncert preference
     "aif_meta_pref_effort_precision"     : 1,  // Precision for effort preference
     // Observation preference means (target values for each observation dimension)
     "aif_meta_pref_extrinsic_mean"       : 0.9,  // Prefer high extrinsic value (goal achievement)
-    "aif_meta_pref_policy_uncert_mean"   : 0.0,  // Prefer low policy uncertainty
-    "aif_meta_pref_model_uncert_mean"    : 0.0,  // Prefer low model uncertainty
     "aif_meta_pref_effort_mean"          : 0.0,  // Prefer low effort
     "aif_meta_capacity_exponent"         : 0.3,  // Exponent on normalized capacity (<1 compresses, >1 amplifies)
+    "aif_meta_planning_variance_reduction_factor": 0.8, // Factor for planning variance reduction (0-1)
+    "aif_meta_planning_noise_factor"     : 1.0, // Noise scaling from model unreliability
     "aif_meta_extrinsic_value_weight"    : 0.9,  // Weight on extrinsic value in composite θ (0 = policy uncert only)
     "aif_meta_risk_include_variance"     : true, // Include τ·σ² variance term in risk (full KL divergence)
     // EMA betas for feature tracking

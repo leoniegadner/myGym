@@ -82,20 +82,17 @@ class MetaGenerativeModel:
         policy_ambiguity_weight: float,
         model_ambiguity_weight: float,
         total_capacity: np.ndarray,
-        depth_capacity: np.ndarray,
         complexity: np.ndarray,
         habit_deviation: np.ndarray,
         is_deterministic: np.ndarray,
         pref_extrinsic_precision: float = 1.0,
-        pref_policy_uncert_precision: float = 1.0,
-        pref_model_uncert_precision: float = 1.0,
         pref_effort_precision: float = 1.0,
         pref_extrinsic_mean: float = 1.0,
-        pref_policy_uncert_mean: float = 0.0,
-        pref_model_uncert_mean: float = 0.0,
         pref_effort_mean: float = 0.0,
         capacity_exponent: float = 1.0,
         variance_exponent: float = 2.65,
+        planning_variance_reduction_factor: float = 0.8,
+        planning_noise_factor: float = 1.0,
         extrinsic_value_weight: float = 0.3,
         risk_include_variance: bool = False,
     ):
@@ -106,17 +103,12 @@ class MetaGenerativeModel:
             policy_ambiguity_weight: Weight on ambiguity term H(P(o|θ, mode))
             model_ambiguity_weight: Scales model uncertainty in likelihood sharpness
             total_capacity: Planning capacity per mode [n_modes]
-            depth_capacity: Horizon depth per mode [n_modes]
             complexity: Computational complexity per mode [n_modes]
             habit_deviation: Deviation from habitual prior per mode [n_modes]
             is_deterministic: Boolean mask for deterministic modes [n_modes]
             pref_extrinsic_precision: Precision for extrinsic_value preference
-            pref_policy_uncert_precision: Precision for policy_uncert preference
-            pref_model_uncert_precision: Precision for model_uncert preference
             pref_effort_precision: Precision for effort preference
             pref_extrinsic_mean: Preferred mean for extrinsic_value (1.0 = prefer high)
-            pref_policy_uncert_mean: Preferred mean for policy_uncert (0.0 = prefer low)
-            pref_model_uncert_mean: Preferred mean for model_uncert (0.0 = prefer low)
             pref_effort_mean: Preferred mean for effort (0.0 = prefer low)
             capacity_exponent: Exponent applied to normalized capacity (<1 compresses differences, >1 amplifies)
         """
@@ -125,19 +117,17 @@ class MetaGenerativeModel:
 
         # Observation preference precisions (higher = stronger preference)
         self.pref_extrinsic_precision = pref_extrinsic_precision
-        self.pref_policy_uncert_precision = pref_policy_uncert_precision
-        self.pref_model_uncert_precision = pref_model_uncert_precision
         self.pref_effort_precision = pref_effort_precision
 
         # Observation preference means
         self.pref_extrinsic_mean = pref_extrinsic_mean
-        self.pref_policy_uncert_mean = pref_policy_uncert_mean
-        self.pref_model_uncert_mean = pref_model_uncert_mean
         self.pref_effort_mean = pref_effort_mean
 
         # Capacity exponent (<1 compresses differences between modes, >1 amplifies)
         self.capacity_exponent = capacity_exponent
         self.variance_exponent = variance_exponent
+        self.planning_variance_reduction_factor = planning_variance_reduction_factor
+        self.planning_noise_factor = planning_noise_factor
 
         # Weight on extrinsic value signal in composite θ estimate
         self.extrinsic_value_weight = max(0.0, min(1.0, float(extrinsic_value_weight)))
@@ -149,14 +139,12 @@ class MetaGenerativeModel:
 
         # Pre-computed mode characteristics (vectorized)
         self._total_capacity = total_capacity
-        self._depth_capacity = depth_capacity
         self._complexity = complexity
         self._habit_deviation = habit_deviation
         self._is_deterministic = is_deterministic
 
         # Normalize capacities to [0, 1]
         self._max_capacity = np.max(total_capacity) + 1e-6
-        self._max_depth = max(np.max(depth_capacity), 1.0)
         self._max_complexity = np.max(complexity) + 1e-6
 
     def normalize_features(self, features: Dict[str, Any]) -> Dict[str, float]:
@@ -261,8 +249,8 @@ class MetaGenerativeModel:
 
         # Deliberate mode: planning can reduce variance when model is good
         model_unreliability = 1.0 - model_reliability
-        planning_variance_reduction = room_to_improve**2 * model_reliability * 0.8
-        planning_noise = model_unreliability * 1.0
+        planning_variance_reduction = room_to_improve**2 * model_reliability * self.planning_variance_reduction_factor
+        planning_noise = model_unreliability * self.planning_noise_factor
 
         var_deliberate = var_deterministic - planning_variance_reduction + planning_noise
         var_deliberate = max(var_deliberate, 0.01)
@@ -293,16 +281,12 @@ class MetaGenerativeModel:
 
         Preferences are over observations, NOT modes:
           - extrinsic_value: prefer high (close to 1)
-          - policy_uncert: prefer low (close to 0)
-          - model_uncert: prefer low (close to 0)
           - effort: prefer low (close to 0)
 
         Returns Gaussian preference parameters for each observation dimension.
         """
         return {
             "extrinsic_value": {"mean": self.pref_extrinsic_mean, "precision": self.pref_extrinsic_precision},
-            "policy_uncert": {"mean": self.pref_policy_uncert_mean, "precision": self.pref_policy_uncert_precision},
-            "model_uncert": {"mean": self.pref_model_uncert_mean, "precision": self.pref_model_uncert_precision},
             "effort": {"mean": self.pref_effort_mean, "precision": self.pref_effort_precision},
         }
 
@@ -313,24 +297,24 @@ class MetaGenerativeModel:
         Compute P(o|θ, mode) for each mode at a single θ point.
 
         Returns:
-            expected_obs: [n_modes, 4] - expected observation per mode
-            obs_variance: [n_modes, 4] - variance of observations per mode
+            expected_obs: [n_modes, 2] - expected observation per mode
+            obs_variance: [n_modes, 2] - variance of observations per mode
         """
         expected, variances = self._likelihood(theta, normalized_features)
         # expected: [n_modes, 3], variances: [n_modes, 3]
+        # Only extrinsic_value (index 0) is mode-dependent
 
-        # Add effort as 4th observation dimension
         normalized_cost = self._complexity / (self._max_complexity + 1e-6)  # [n_modes]
 
-        expected_obs = np.concatenate([
-            expected,
-            normalized_cost[:, None]  # [n_modes, 1]
-        ], axis=-1)  # [n_modes, 4]
+        expected_obs = np.stack([
+            expected[:, 0],          # extrinsic_value
+            normalized_cost,         # effort
+        ], axis=-1)  # [n_modes, 2]
 
-        obs_variance = np.concatenate([
-            variances,
-            np.full((len(self._complexity), 1), 1e-6)
-        ], axis=-1)  # [n_modes, 4]
+        obs_variance = np.stack([
+            variances[:, 0],                            # extrinsic_value
+            np.full(len(self._complexity), 1e-6),       # effort (deterministic)
+        ], axis=-1)  # [n_modes, 2]
 
         return expected_obs, obs_variance
 
@@ -363,27 +347,23 @@ class MetaGenerativeModel:
         expected_obs, obs_variance = self._expected_observations(
             theta, normalized_features
         )
-        # expected_obs: [n_modes, 4], obs_variance: [n_modes, 4]
+        # expected_obs: [n_modes, 2], obs_variance: [n_modes, 2]
 
         pref_means = np.array([
             prefs["extrinsic_value"]["mean"],
-            prefs["policy_uncert"]["mean"],
-            prefs["model_uncert"]["mean"],
             prefs["effort"]["mean"],
-        ])  # [4]
+        ])  # [2]
 
         pref_precisions = np.array([
             prefs["extrinsic_value"]["precision"],
-            prefs["policy_uncert"]["precision"],
-            prefs["model_uncert"]["precision"],
             prefs["effort"]["precision"],
-        ])  # [4]
+        ])  # [2]
 
-        mu_diff = expected_obs - pref_means[None, :]  # [n_modes, 4]
+        mu_diff = expected_obs - pref_means[None, :]  # [n_modes, 2]
         # One-sided extrinsic risk: only penalize when predicted value is BELOW
         # the preference mean (undershooting). Exceeding the preference is fine.
         mu_diff[:, 0] = np.minimum(mu_diff[:, 0], 0.0)
-        mu_diff_sq = mu_diff ** 2  # [n_modes, 4]
+        mu_diff_sq = mu_diff ** 2  # [n_modes, 2]
         risk = np.sum(pref_precisions[None, :] * mu_diff_sq, axis=-1)  # [n_modes]
 
         if self.risk_include_variance:
@@ -505,19 +485,17 @@ class MetaPlanningController:
 
         # Observation preference precisions (higher = stronger preference)
         self.pref_extrinsic_precision = float(config.get("pref_extrinsic_precision", 1.0))
-        self.pref_policy_uncert_precision = float(config.get("pref_policy_uncert_precision", 1.0))
-        self.pref_model_uncert_precision = float(config.get("pref_model_uncert_precision", 1.0))
         self.pref_effort_precision = float(config.get("pref_effort_precision", 1.0))
 
         # Observation preference means
         self.pref_extrinsic_mean = float(config.get("pref_extrinsic_mean", 1.0))
-        self.pref_policy_uncert_mean = float(config.get("pref_policy_uncert_mean", 0.0))
-        self.pref_model_uncert_mean = float(config.get("pref_model_uncert_mean", 0.0))
         self.pref_effort_mean = float(config.get("pref_effort_mean", 0.0))
 
         # Capacity exponent
         self.capacity_exponent = float(config.get("capacity_exponent", 1.0))
         self.variance_exponent = float(config.get("variance_exponent", 2.65))
+        self.planning_variance_reduction_factor = float(config.get("planning_variance_reduction_factor", 0.8))
+        self.planning_noise_factor = float(config.get("planning_noise_factor", 1.0))
 
         # Weight on extrinsic value signal in composite θ estimate
         self.extrinsic_value_weight = float(config.get("extrinsic_value_weight", 0.3))
@@ -552,7 +530,6 @@ class MetaPlanningController:
         self.mc_models_step = _coerce_int(config.get("mc_models_step"), default=1)
         self.mc_traj_step = _coerce_int(config.get("mc_trajectories_step"), default=1)
         self.action_rollouts_step = _coerce_int(config.get("action_rollouts_step"), default=1)
-        self.max_modes = config.get("max_modes")
 
         self.mode_count = max(1, int(config.get("mode_count", 3)))
         self.modes = self._init_modes(modes)
@@ -565,20 +542,17 @@ class MetaPlanningController:
             policy_ambiguity_weight=self.policy_ambiguity_weight,
             model_ambiguity_weight=self.model_ambiguity_weight,
             total_capacity=self._total_capacity,
-            depth_capacity=self._depth_capacity,
             complexity=self._complexity,
             habit_deviation=self._habit_deviation,
             is_deterministic=self._is_deterministic,
             pref_extrinsic_precision=self.pref_extrinsic_precision,
-            pref_policy_uncert_precision=self.pref_policy_uncert_precision,
-            pref_model_uncert_precision=self.pref_model_uncert_precision,
             pref_effort_precision=self.pref_effort_precision,
             pref_extrinsic_mean=self.pref_extrinsic_mean,
-            pref_policy_uncert_mean=self.pref_policy_uncert_mean,
-            pref_model_uncert_mean=self.pref_model_uncert_mean,
             pref_effort_mean=self.pref_effort_mean,
             capacity_exponent=self.capacity_exponent,
             variance_exponent=self.variance_exponent,
+            planning_variance_reduction_factor=self.planning_variance_reduction_factor,
+            planning_noise_factor=self.planning_noise_factor,
             extrinsic_value_weight=self.extrinsic_value_weight,
             risk_include_variance=self.risk_include_variance,
         )
@@ -639,10 +613,6 @@ class MetaPlanningController:
         det_indices = np.where(self._is_deterministic)[0]
         self._deterministic_idx = int(det_indices[0]) if det_indices.size > 0 else None
 
-        self._depth_capacity = self._H
-        self._breadth_capacity = np.log1p(self._N)
-        self._ensemble_capacity = np.log1p(self._M) + np.log1p(self._T)
-        self._rollout_capacity = np.log1p(self._R)
         H_max = max(self._H.max(), 1.0)
         N_max = max(self._N.max(), 1.0)
         M_max = max(self._M.max(), 1.0)

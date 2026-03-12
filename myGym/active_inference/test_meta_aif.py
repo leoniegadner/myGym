@@ -75,17 +75,15 @@ def create_test_generative_model(config=None):
 
     # Observation preference precisions
     pref_extrinsic_precision = config.get("aif_meta_pref_extrinsic_precision", 1.0)
-    pref_policy_uncert_precision = config.get("aif_meta_pref_policy_uncert_precision", 1.0)
-    pref_model_uncert_precision = config.get("aif_meta_pref_model_uncert_precision", 1.0)
     pref_effort_precision = config.get("aif_meta_pref_effort_precision", 1.0)
 
     # Observation preference means
     pref_extrinsic_mean = config.get("aif_meta_pref_extrinsic_mean", 1.0)
-    pref_policy_uncert_mean = config.get("aif_meta_pref_policy_uncert_mean", 0.0)
-    pref_model_uncert_mean = config.get("aif_meta_pref_model_uncert_mean", 0.0)
     pref_effort_mean = config.get("aif_meta_pref_effort_mean", 0.0)
     capacity_exponent = config.get("aif_meta_capacity_exponent", 1.0)
     variance_exponent = config.get("aif_meta_variance_exponent", 2.65)
+    planning_variance_reduction_factor = config.get("aif_meta_planning_variance_reduction_factor", 0.8)
+    planning_noise_factor = config.get("aif_meta_planning_noise_factor", 1.0)
 
     # Build mode grid with aligned parameters (low with low, high with high)
     h_vals = range_inclusive(horizon_min, horizon_max, horizon_step)
@@ -184,26 +182,21 @@ def create_test_generative_model(config=None):
     )
     habit_deviation = np.where(is_deterministic, 0.0, habit_deviation)
 
-    depth_capacity = horizons
-
     model = MetaGenerativeModel(
         policy_ambiguity_weight=policy_ambiguity_weight,
         model_ambiguity_weight=model_ambiguity_weight,
         total_capacity=total_capacity,
-        depth_capacity=depth_capacity,
         complexity=complexity,
         habit_deviation=habit_deviation,
         is_deterministic=is_deterministic,
         pref_extrinsic_precision=pref_extrinsic_precision,
-        pref_policy_uncert_precision=pref_policy_uncert_precision,
-        pref_model_uncert_precision=pref_model_uncert_precision,
         pref_effort_precision=pref_effort_precision,
         pref_extrinsic_mean=pref_extrinsic_mean,
-        pref_policy_uncert_mean=pref_policy_uncert_mean,
-        pref_model_uncert_mean=pref_model_uncert_mean,
         pref_effort_mean=pref_effort_mean,
         capacity_exponent=capacity_exponent,
         variance_exponent=variance_exponent,
+        planning_variance_reduction_factor=planning_variance_reduction_factor,
+        planning_noise_factor=planning_noise_factor,
     )
 
     # Create mode names
@@ -220,13 +213,9 @@ def create_test_generative_model(config=None):
     print(f"  model_ambiguity_weight={model_ambiguity_weight}")
     print(f"\nObservation preference precisions:")
     print(f"  pref_extrinsic_precision={pref_extrinsic_precision}")
-    print(f"  pref_policy_uncert_precision={pref_policy_uncert_precision}")
-    print(f"  pref_model_uncert_precision={pref_model_uncert_precision}")
     print(f"  pref_effort_precision={pref_effort_precision}")
     print(f"\nObservation preference means:")
     print(f"  pref_extrinsic_mean={pref_extrinsic_mean}")
-    print(f"  pref_policy_uncert_mean={pref_policy_uncert_mean}")
-    print(f"  pref_model_uncert_mean={pref_model_uncert_mean}")
     print(f"  pref_effort_mean={pref_effort_mean}")
     return model, mode_names, modes
 
